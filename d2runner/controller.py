@@ -228,9 +228,19 @@ class ControllerBackend:
             prev_axes_direction: str | None = None
             prev_buttons_pressed: set[int] = set()
             prev_all_buttons_pressed: set[int] = set()
+            pump_failed_logged = False
 
             while not self._stop.is_set():
                 direction: str | None = None
+
+                # SDL-backed joystick state is refreshed by pumping the event queue.
+                # Without this, hat/button/axis values may remain stuck at startup.
+                try:
+                    pygame.event.pump()
+                except Exception as exc:
+                    if not pump_failed_logged:
+                        pump_failed_logged = True
+                        self.log.warning("controller_event_pump_failed %s", exc)
 
                 if has_hat:
                     try:
