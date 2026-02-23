@@ -1246,6 +1246,7 @@ class D2RunnerQtApp:
         key_edits: dict[str, object] = {}
         dpad_boxes: dict[str, object] = {}
         xbox_button_boxes: dict[str, object] = {}
+        xbox_button_selected: dict[str, str] = {}
         dpad_choices = ["none", "up", "right", "down", "left"]
         xbox_button_choices = ["none", *XBOX_BUTTON_ORDER]
         for action in ACTION_ORDER:
@@ -1272,6 +1273,37 @@ class D2RunnerQtApp:
                     bbox.addItem(XBOX_BUTTON_LABELS.get(button_name, button_name), button_name)
             idx = max(0, bbox.findData(inv_button.get(action, "none")))
             bbox.setCurrentIndex(idx)
+            xbox_button_selected[action] = inv_button.get(action, "none") if inv_button.get(action, "none") in {"none", *XBOX_BUTTON_ORDER} else "none"
+
+            def _capture_xbox_button_selection(_index: int, action_name: str = action, box: object = bbox) -> None:
+                try:
+                    cur_idx = int(box.currentIndex())
+                    raw = box.itemData(cur_idx)
+                    if isinstance(raw, str) and raw in {"none", *XBOX_BUTTON_ORDER}:
+                        xbox_button_selected[action_name] = raw
+                        self.log.info(
+                            "qt_xbox_button_combo_changed action=%s button=%s index=%s",
+                            action_name,
+                            raw,
+                            cur_idx,
+                        )
+                        return
+                    text = (box.currentText() or "").strip()
+                    xbox_button_selected[action_name] = button_label_to_name.get(
+                        text,
+                        text if text in XBOX_BUTTON_ORDER else "none",
+                    )
+                    self.log.info(
+                        "qt_xbox_button_combo_changed action=%s button=%s text=%s index=%s",
+                        action_name,
+                        xbox_button_selected[action_name],
+                        text,
+                        cur_idx,
+                    )
+                except Exception:
+                    xbox_button_selected[action_name] = "none"
+
+            bbox.currentIndexChanged.connect(_capture_xbox_button_selection)  # type: ignore[attr-defined]
             grid.addWidget(bbox, row, 3)
             xbox_button_boxes[action] = bbox
             row += 1
@@ -1315,7 +1347,12 @@ class D2RunnerQtApp:
                 selected_buttons: dict[str, str] = {}
                 for action in ACTION_ORDER:
                     box = xbox_button_boxes[action]
-                    raw = box.currentData()
+                    cached = xbox_button_selected.get(action, "none")
+                    if cached in {"none", *XBOX_BUTTON_ORDER}:
+                        selected_buttons[action] = cached
+                        continue
+                    cur_idx = box.currentIndex()
+                    raw = box.itemData(cur_idx)
                     if isinstance(raw, str) and raw in {"none", *XBOX_BUTTON_ORDER}:
                         selected_buttons[action] = raw
                         continue
