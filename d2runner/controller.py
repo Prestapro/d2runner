@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -178,12 +179,23 @@ class ControllerBackend:
     def _run(self) -> None:
         pygame = None
         try:
+            # On Windows/Linux we run the controller backend in a background thread
+            # without a pygame window. Joystick state updates still rely on SDL's
+            # event subsystem, so use the dummy video driver before importing pygame.
+            if sys.platform != "darwin":
+                os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+
             import pygame as _pygame  # type: ignore
 
             pygame = _pygame
             # Do not call pygame.init() in this background thread on macOS:
             # it initializes SDL video/keyboard and can crash with dispatch
             # assertions inside HIToolbox when not on the main thread.
+            if sys.platform != "darwin":
+                try:
+                    pygame.display.init()
+                except Exception as exc:
+                    self.log.warning("controller_display_init_failed %s", exc)
             pygame.joystick.init()
 
             count = pygame.joystick.get_count()
