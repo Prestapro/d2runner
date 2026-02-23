@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Local runtime artifacts
+*.log
+runs*.csv
+controller_mapping.json
+
+# Build outputs
+build/
+dist/
+*.spec
+
+# macOS / Windows noise
+.DS_Store
+Thumbs.db
