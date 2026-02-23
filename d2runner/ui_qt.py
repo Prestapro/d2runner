@@ -1241,6 +1241,7 @@ class D2RunnerQtApp:
         for button_name, action in self.controller_config.button_map.items():
             if action in inv_button:
                 inv_button[action] = button_name
+        button_label_to_name = {"none": "none", **{label: name for name, label in XBOX_BUTTON_LABELS.items()}}
 
         key_edits: dict[str, object] = {}
         dpad_boxes: dict[str, object] = {}
@@ -1311,10 +1312,16 @@ class D2RunnerQtApp:
                 if dup_d:
                     direction, actions = dup_d
                     raise ValueError(f"Duplicate D-pad direction '{direction}' for: {', '.join(actions)}")
-                selected_buttons = {
-                    action: str(xbox_button_boxes[action].currentData())
-                    for action in ACTION_ORDER
-                }
+                selected_buttons: dict[str, str] = {}
+                for action in ACTION_ORDER:
+                    box = xbox_button_boxes[action]
+                    raw = box.currentData()
+                    if isinstance(raw, str) and raw in {"none", *XBOX_BUTTON_ORDER}:
+                        selected_buttons[action] = raw
+                        continue
+                    text = (box.currentText() or "").strip()
+                    selected_buttons[action] = button_label_to_name.get(text, text if text in XBOX_BUTTON_ORDER else "none")
+                self.log.info("qt_settings_selected_xbox_buttons %s", selected_buttons)
                 dup_b = self._find_duplicate_controller_buttons(selected_buttons)
                 if dup_b:
                     button_name, actions = dup_b
