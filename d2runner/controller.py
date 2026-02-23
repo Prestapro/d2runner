@@ -8,6 +8,7 @@ import os
 import sys
 import threading
 import time
+import ctypes
 
 
 VALID_ACTIONS = {
@@ -236,11 +237,20 @@ class ControllerBackend:
                 axis_dpad_pair,
             )
 
+            xinput = self._try_init_xinput(self.config.device_index)
+            if xinput is not None:
+                self.log.info(
+                    "controller_xinput_enabled user_index=%s dll=%s",
+                    xinput["user_index"],
+                    xinput["dll_name"],
+                )
+
             prev_hat_value: tuple[int, int] | None = None
             prev_axes_direction: str | None = None
             prev_buttons_pressed: set[int] = set()
             prev_all_buttons_pressed: set[int] = set()
             pump_failed_logged = False
+            prev_xinput_buttons: int | None = None
 
             while not self._stop.is_set():
                 direction: str | None = None
@@ -254,7 +264,15 @@ class ControllerBackend:
                         pump_failed_logged = True
                         self.log.warning("controller_event_pump_failed %s", exc)
 
-                if has_hat:
+                if xinput is not None:
+                    xinput_direction, prev_xinput_buttons = self._poll_xinput_dpad(
+                        xinput,
+                        prev_xinput_buttons,
+                    )
+                    if xinput_direction is not None:
+                        direction = xinput_direction
+
+                if direction is None and has_hat:
                     try:
                         value = joystick.get_hat(self.config.hat_index)
                     except Exception as exc:
@@ -412,3 +430,83 @@ class ControllerBackend:
         if last is None:
             return False
         return (now - last) * 1000 < max(self.config.repeat_guard_ms, 0)
+
+    def _try_init_xinput(self, user_index: int) -> dict[str, object] | None:
+        if sys.platform != "win32":
+            return None
+        if user_index < 0 or user_index > 3:
+            return None
+        for dll_name in ("xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"):
+            try:
+                dll = ctypes.WinDLL(dll_name)
+            except Exception:
+                continue
+            try:
+                get_state = dll.XInputGetState
+            except Exception:
+                continue
+            get_state.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+            get_state.restype = ctypes.c_uint32
+            xstate = self._xinput_state_struct()
+            state = xstate()
+            rc = int(get_state(int(user_index), ctypes.byref(state)))
+            if rc == 0:
+                return {"dll": dll, "dll_name": dll_name, "get_state": get_state, "user_index": int(user_index)}
+        return None
+
+    @staticmethod
+    def _xinput_state_struct():
+        class XINPUT_GAMEPAD(ctypes.Structure):
+            _fields_ = [
+                ("wButtons", ctypes.c_uint16),
+                ("bLeftTrigger", ctypes.c_ubyte),
+                ("bRightTrigger", ctypes.c_ubyte),
+                ("sThumbLX", ctypes.c_int16),
+                ("sThumbLY", ctypes.c_int16),
+                ("sThumbRX", ctypes.c_int16),
+                ("sThumbRY", ctypes.c_int16),
+            ]
+
+        class XINPUT_STATE(ctypes.Structure):
+            _fields_ = [
+                ("dwPacketNumber", ctypes.c_uint32),
+                ("Gamepad", XINPUT_GAMEPAD),
+            ]
+
+        return XINPUT_STATE
+
+    def _poll_xinput_dpad(
+        self,
+        xinput: dict[str, object],
+        prev_buttons: int | None,
+    ) -> tuple[str | None, int | None]:
+        xstate = self._xinput_state_struct()
+        state = xstate()
+        try:
+            rc = int(xinput["get_state"](int(xinput["user_index"]), ctypes.byref(state)))  # type: ignore[index]
+        except Exception:
+            return None, prev_buttons
+        if rc != 0:
+            return None, prev_buttons
+
+        buttons = int(state.Gamepad.wButtons)
+        if prev_buttons != buttons:
+            self.log.info("controller_xinput_buttons buttons=0x%04x", buttons)
+
+        # XINPUT_GAMEPAD_DPAD_* bit masks
+        dpad_masks = (
+            (0x0001, "up"),
+            (0x0008, "right"),
+            (0x0002, "down"),
+            (0x0004, "left"),
+        )
+
+        direction: str | None = None
+        if prev_buttons is None:
+            prev_buttons = 0
+        newly_pressed = buttons & ~prev_buttons
+        for mask, name in dpad_masks:
+            if newly_pressed & mask:
+                direction = name
+                break
+        return direction, buttons
