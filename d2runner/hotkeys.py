@@ -111,7 +111,7 @@ def _apply_pynput_macos_globalhotkeys_compat(keyboard_module: object) -> None:
 
 
 class HotkeyBackend:
-    def __init__(self, on_action: HotkeyHandler, keyboard_map: dict[str, str]) -> None:
+    def __init__(self, on_action: HotkeyHandler, keyboard_map: dict[str, str], enabled: bool = True) -> None:
         self.on_action = on_action
         self._listener = None
         self.available = False
@@ -121,11 +121,17 @@ class HotkeyBackend:
         self._fired_keys: set[str] = set()
         self._last_action_at: dict[str, float] = {}
         self._repeat_guard_ms = 700
+        self.enabled = bool(enabled)
         self.keyboard_map = dict(keyboard_map)
         self._parsed_bindings: dict[str, ParsedCombo] = {}
         self._reload_parsed_bindings()
 
     def start(self) -> None:
+        if not self.enabled:
+            self.available = False
+            self.error = "keyboard hotkeys disabled in config"
+            self.log.info("hotkeys_disabled")
+            return
         try:
             from pynput import keyboard  # type: ignore
         except Exception as exc:  # pragma: no cover
@@ -149,10 +155,12 @@ class HotkeyBackend:
             self.log.exception("hotkeys_backend_failed")
             self.available = False
 
-    def reload_bindings(self, keyboard_map: dict[str, str]) -> None:
+    def reload_bindings(self, keyboard_map: dict[str, str], enabled: bool | None = None) -> None:
+        if enabled is not None:
+            self.enabled = bool(enabled)
         self.keyboard_map = dict(keyboard_map)
         self._reload_parsed_bindings()
-        self.log.info("hotkeys_bindings_reloaded %s", self.keyboard_map)
+        self.log.info("hotkeys_bindings_reloaded enabled=%s %s", self.enabled, self.keyboard_map)
 
     def stop(self) -> None:
         if self._listener is not None:

@@ -6,7 +6,14 @@ from pathlib import Path
 from queue import Empty, Queue
 import sys
 
-from .controller import ControllerBackend, ControllerConfig, load_controller_config, save_controller_config
+from .controller import (
+    ControllerBackend,
+    ControllerConfig,
+    XBOX_BUTTON_LABELS,
+    XBOX_BUTTON_ORDER,
+    load_controller_config,
+    save_controller_config,
+)
 from .core import CsvRunLogger, RunTracker
 from .hotkeys import ACTION_ORDER, ACTION_TITLES, HotkeyBackend, human_combo_label, normalize_combo_string
 
@@ -154,6 +161,7 @@ class D2RunnerQtApp:
         self.hotkeys = HotkeyBackend(
             lambda action: self.command_queue.put(("global_hotkey", action)),
             self.controller_config.keyboard_map,
+            enabled=self.controller_config.keyboard_enabled,
         )
         self.controller = ControllerBackend(
             lambda action: self.command_queue.put(("controller", action)),
@@ -1009,6 +1017,9 @@ class D2RunnerQtApp:
                 pass
         self._qt_shortcuts = []
 
+        if not self.controller_config.keyboard_enabled:
+            return
+
         for action in ACTION_ORDER:
             combo = self.controller_config.keyboard_map.get(action, "")
             portable = _internal_combo_to_qt_portable(combo)
@@ -1056,6 +1067,17 @@ class D2RunnerQtApp:
         for direction, actions in seen.items():
             if len(actions) > 1:
                 return direction, actions
+        return None
+
+    def _find_duplicate_controller_buttons(self, selected_buttons: dict[str, str]) -> tuple[str, list[str]] | None:
+        seen: dict[str, list[str]] = {}
+        for action, button_name in selected_buttons.items():
+            if button_name == "none":
+                continue
+            seen.setdefault(button_name, []).append(ACTION_TITLES.get(action, action))
+        for button_name, actions in seen.items():
+            if len(actions) > 1:
+                return button_name, actions
         return None
 
     def _open_settings_dialog(self) -> None:
@@ -1152,29 +1174,33 @@ class D2RunnerQtApp:
         enable_cb.setChecked(self.controller_config.enabled)
         top_grid.addWidget(enable_cb, 0, 0, 1, 2)
 
+        enable_keyboard_cb = self.QCheckBox("Enable keyboard hotkeys")
+        enable_keyboard_cb.setChecked(self.controller_config.keyboard_enabled)
+        top_grid.addWidget(enable_keyboard_cb, 1, 0, 1, 2)
+
         lbl_dev = self.QLabel("Device index")
         lbl_dev.setStyleSheet(_lbl_style)
-        top_grid.addWidget(lbl_dev, 1, 0)
+        top_grid.addWidget(lbl_dev, 2, 0)
         device_spin = self.QSpinBox()
         device_spin.setRange(0, 32)
         device_spin.setValue(self.controller_config.device_index)
-        top_grid.addWidget(device_spin, 1, 1)
+        top_grid.addWidget(device_spin, 2, 1)
 
         lbl_hat = self.QLabel("Hat index (D-pad)")
         lbl_hat.setStyleSheet(_lbl_style)
-        top_grid.addWidget(lbl_hat, 2, 0)
+        top_grid.addWidget(lbl_hat, 3, 0)
         hat_spin = self.QSpinBox()
         hat_spin.setRange(0, 16)
         hat_spin.setValue(self.controller_config.hat_index)
-        top_grid.addWidget(hat_spin, 2, 1)
+        top_grid.addWidget(hat_spin, 3, 1)
 
         lbl_guard = self.QLabel("Repeat guard ms")
         lbl_guard.setStyleSheet(_lbl_style)
-        top_grid.addWidget(lbl_guard, 3, 0)
+        top_grid.addWidget(lbl_guard, 4, 0)
         guard_spin = self.QSpinBox()
         guard_spin.setRange(0, 5000)
         guard_spin.setValue(self.controller_config.repeat_guard_ms)
-        top_grid.addWidget(guard_spin, 3, 1)
+        top_grid.addWidget(guard_spin, 4, 1)
 
         # ── Separator ──
         sep = self.QFrame()
@@ -1189,6 +1215,7 @@ class D2RunnerQtApp:
         grid.setColumnMinimumWidth(0, 140)
         grid.setColumnStretch(1, 1)
         grid.setColumnMinimumWidth(2, 80)
+        grid.setColumnMinimumWidth(3, 170)
         layout.addLayout(grid)
 
         row = 0
@@ -1201,16 +1228,25 @@ class D2RunnerQtApp:
         h_dpad = self.QLabel("D-PAD")
         h_dpad.setStyleSheet(_header_style)
         grid.addWidget(h_dpad, row, 2)
+        h_xbtn = self.QLabel("XBOX BUTTON")
+        h_xbtn.setStyleSheet(_header_style)
+        grid.addWidget(h_xbtn, row, 3)
         row += 1
 
         inv_dpad = {action: "none" for action in ACTION_ORDER}
         for direction, action in self.controller_config.dpad_map.items():
             if action in inv_dpad:
                 inv_dpad[action] = direction
+        inv_button = {action: "none" for action in ACTION_ORDER}
+        for button_name, action in self.controller_config.button_map.items():
+            if action in inv_button:
+                inv_button[action] = button_name
 
         key_edits: dict[str, object] = {}
         dpad_boxes: dict[str, object] = {}
+        xbox_button_boxes: dict[str, object] = {}
         dpad_choices = ["none", "up", "right", "down", "left"]
+        xbox_button_choices = ["none", *XBOX_BUTTON_ORDER]
         for action in ACTION_ORDER:
             act_lbl = self.QLabel(ACTION_TITLES[action])
             act_lbl.setStyleSheet(_row_label_style)
@@ -1226,9 +1262,23 @@ class D2RunnerQtApp:
             dbox.setCurrentText(inv_dpad.get(action, "none"))
             grid.addWidget(dbox, row, 2)
             dpad_boxes[action] = dbox
+
+            bbox = self.QComboBox()
+            for button_name in xbox_button_choices:
+                if button_name == "none":
+                    bbox.addItem("none", "none")
+                else:
+                    bbox.addItem(XBOX_BUTTON_LABELS.get(button_name, button_name), button_name)
+            idx = max(0, bbox.findData(inv_button.get(action, "none")))
+            bbox.setCurrentIndex(idx)
+            grid.addWidget(bbox, row, 3)
+            xbox_button_boxes[action] = bbox
             row += 1
 
-        info = self.QLabel("Changes apply immediately after Save. Duplicate bindings are blocked.")
+        info = self.QLabel(
+            "Changes apply immediately after Save. D-pad and Xbox buttons are separate inputs. "
+            "Disable keyboard hotkeys to use controller-only mode."
+        )
         info.setStyleSheet("font-size: 12px; color: rgba(29,29,31,100); font-weight: 400;")
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -1252,7 +1302,7 @@ class D2RunnerQtApp:
                     portable = key_edits[action].keySequence().toString(self.QKeySequence.PortableText)
                     keyboard_map[action] = _qt_portable_to_internal(portable)
                 dup = self._find_duplicate_bindings(keyboard_map)
-                if dup:
+                if enable_keyboard_cb.isChecked() and dup:
                     combo, actions = dup
                     raise ValueError(f"Duplicate keyboard binding '{combo}' for: {', '.join(actions)}")
 
@@ -1261,22 +1311,41 @@ class D2RunnerQtApp:
                 if dup_d:
                     direction, actions = dup_d
                     raise ValueError(f"Duplicate D-pad direction '{direction}' for: {', '.join(actions)}")
+                selected_buttons = {
+                    action: str(xbox_button_boxes[action].currentData())
+                    for action in ACTION_ORDER
+                }
+                dup_b = self._find_duplicate_controller_buttons(selected_buttons)
+                if dup_b:
+                    button_name, actions = dup_b
+                    raise ValueError(
+                        f"Duplicate Xbox button '{XBOX_BUTTON_LABELS.get(button_name, button_name)}' for: {', '.join(actions)}"
+                    )
                 dpad_map = {"up": "none", "right": "none", "down": "none", "left": "none"}
                 for action, direction in selected_dirs.items():
                     if direction in dpad_map:
                         dpad_map[direction] = action
+                button_map = {name: "none" for name in XBOX_BUTTON_ORDER}
+                for action, button_name in selected_buttons.items():
+                    if button_name in button_map:
+                        button_map[button_name] = action
 
                 new_cfg = ControllerConfig(
                     enabled=enable_cb.isChecked(),
+                    keyboard_enabled=enable_keyboard_cb.isChecked(),
                     device_index=device_spin.value(),
                     hat_index=hat_spin.value(),
                     repeat_guard_ms=guard_spin.value(),
                     dpad_map=dpad_map,
                     keyboard_map=keyboard_map,
+                    button_map=button_map,
                 )
                 save_controller_config(self.controller_config_path, new_cfg, self.log)
                 self.controller_config = load_controller_config(self.controller_config_path, self.log)
-                self.hotkeys.reload_bindings(self.controller_config.keyboard_map)
+                self.hotkeys.reload_bindings(
+                    self.controller_config.keyboard_map,
+                    enabled=self.controller_config.keyboard_enabled,
+                )
                 self.controller.reload(self.controller_config)
                 self._rebuild_qt_shortcuts()
                 self._refresh_action_button_labels()

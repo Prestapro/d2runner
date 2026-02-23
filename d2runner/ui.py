@@ -7,7 +7,15 @@ import sys
 import tkinter as tk
 from tkinter import ttk
 
-from .controller import ControllerBackend, ControllerConfig, VALID_ACTIONS, load_controller_config, save_controller_config
+from .controller import (
+    ControllerBackend,
+    ControllerConfig,
+    VALID_ACTIONS,
+    XBOX_BUTTON_LABELS,
+    XBOX_BUTTON_ORDER,
+    load_controller_config,
+    save_controller_config,
+)
 from .core import CsvRunLogger, RunTracker
 from .hotkeys import ACTION_ORDER, ACTION_TITLES, HotkeyBackend, human_combo_label, normalize_combo_string
 
@@ -34,6 +42,7 @@ class D2RunnerApp:
         self.hotkeys = HotkeyBackend(
             lambda action: self.command_queue.put(("global_hotkey", action)),
             self.controller_config.keyboard_map,
+            enabled=self.controller_config.keyboard_enabled,
         )
         self.controller = ControllerBackend(
             lambda action: self.command_queue.put(("controller", action)),
@@ -381,6 +390,10 @@ class D2RunnerApp:
                 pass
         self._bound_local_sequences = set()
 
+        if not self.controller_config.keyboard_enabled:
+            self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+            return
+
         bindings = self._local_tk_bindings()
         for sequence in bindings["toggle_start_stop"]:
             self.root.bind(sequence, lambda _e: self.handle_action("toggle_start_stop", source="local_hotkey"))
@@ -531,6 +544,7 @@ class D2RunnerApp:
             pass
 
         enabled_var = tk.BooleanVar(value=self.controller_config.enabled)
+        keyboard_enabled_var = tk.BooleanVar(value=self.controller_config.keyboard_enabled)
         device_var = tk.StringVar(value=str(self.controller_config.device_index))
         hat_var = tk.StringVar(value=str(self.controller_config.hat_index))
         guard_var = tk.StringVar(value=str(self.controller_config.repeat_guard_ms))
@@ -539,8 +553,14 @@ class D2RunnerApp:
         for direction, action in self.controller_config.dpad_map.items():
             if action in inverse_dpad:
                 inverse_dpad[action] = direction
+        inverse_button = {action: "none" for action in ACTION_ORDER}
+        for button_name, action in self.controller_config.button_map.items():
+            if action in inverse_button:
+                inverse_button[action] = button_name
         keyboard_vars = {action: tk.StringVar(value=self.controller_config.keyboard_map.get(action, "")) for action in ACTION_ORDER}
         dpad_for_action_vars = {action: tk.StringVar(value=inverse_dpad.get(action, "none")) for action in ACTION_ORDER}
+        xbox_button_choices = ["none", *XBOX_BUTTON_ORDER]
+        xbox_button_for_action_vars = {action: tk.StringVar(value=inverse_button.get(action, "none")) for action in ACTION_ORDER}
         capture_state = {"action": None}
         capture_info_var = tk.StringVar(value="Keyboard: click Record, then press a key combo.")
 
@@ -614,6 +634,17 @@ class D2RunnerApp:
             font=self.ui["font_small"],
         ).grid(row=row, column=0, columnspan=2, sticky="w")
         row += 1
+        tk.Checkbutton(
+            frame,
+            text="Enable keyboard hotkeys",
+            variable=keyboard_enabled_var,
+            bg=self.ui["bg_card"],
+            fg=self.ui["fg_primary"],
+            selectcolor=self.ui["bg_card"],
+            activebackground=self.ui["bg_card"],
+            font=self.ui["font_small"],
+        ).grid(row=row, column=0, columnspan=2, sticky="w")
+        row += 1
         tk.Label(frame, text="Device index", bg=self.ui["bg_card"], fg=self.ui["fg_primary"], font=self.ui["font_small"]).grid(row=row, column=0, sticky="w", pady=(6, 2))
         tk.Entry(frame, textvariable=device_var, width=8, font=self.ui["font_small"]).grid(row=row, column=1, sticky="w", pady=(6, 2))
         row += 1
@@ -627,6 +658,7 @@ class D2RunnerApp:
         tk.Label(frame, text="Action", font=(self.ui["font_ui"][0], self.ui["font_ui"][1], "bold"), bg=self.ui["bg_card"], fg=self.ui["fg_primary"]).grid(row=row, column=0, sticky="w", pady=(8, 2))
         tk.Label(frame, text="Keyboard", font=(self.ui["font_ui"][0], self.ui["font_ui"][1], "bold"), bg=self.ui["bg_card"], fg=self.ui["fg_primary"]).grid(row=row, column=1, sticky="w", pady=(8, 2))
         tk.Label(frame, text="D-pad", font=(self.ui["font_ui"][0], self.ui["font_ui"][1], "bold"), bg=self.ui["bg_card"], fg=self.ui["fg_primary"]).grid(row=row, column=2, sticky="w", pady=(8, 2))
+        tk.Label(frame, text="Xbox Button", font=(self.ui["font_ui"][0], self.ui["font_ui"][1], "bold"), bg=self.ui["bg_card"], fg=self.ui["fg_primary"]).grid(row=row, column=3, sticky="w", pady=(8, 2))
         row += 1
 
         for action in ACTION_ORDER:
@@ -653,6 +685,13 @@ class D2RunnerApp:
                 width=10,
                 state="readonly",
             ).grid(row=row, column=2, sticky="w", pady=2)
+            ttk.Combobox(
+                frame,
+                textvariable=xbox_button_for_action_vars[action],
+                values=xbox_button_choices,
+                width=18,
+                state="readonly",
+            ).grid(row=row, column=3, sticky="w", pady=2)
             row += 1
 
         info = tk.Label(
@@ -663,14 +702,14 @@ class D2RunnerApp:
             bg=self.ui["bg_card"],
             font=self.ui["font_small"],
         )
-        info.grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 4))
+        info.grid(row=row, column=0, columnspan=4, sticky="w", pady=(8, 4))
         row += 1
 
         def _save_and_close() -> None:
             try:
                 keyboard_map = {a: normalize_combo_string(v.get()) for a, v in keyboard_vars.items()}
                 duplicate_keyboard = self._find_duplicate_bindings(keyboard_map)
-                if duplicate_keyboard:
+                if keyboard_enabled_var.get() and duplicate_keyboard:
                     combo, actions = duplicate_keyboard
                     raise ValueError(f"Duplicate keyboard binding '{combo}' for: {', '.join(actions)}")
 
@@ -679,23 +718,39 @@ class D2RunnerApp:
                 if duplicate_dpad:
                     direction, actions = duplicate_dpad
                     raise ValueError(f"Duplicate D-pad direction '{direction}' for: {', '.join(actions)}")
+                selected_buttons = {a: xbox_button_for_action_vars[a].get() for a in ACTION_ORDER}
+                duplicate_buttons = self._find_duplicate_controller_buttons(selected_buttons)
+                if duplicate_buttons:
+                    button_name, actions = duplicate_buttons
+                    raise ValueError(
+                        f"Duplicate Xbox button '{XBOX_BUTTON_LABELS.get(button_name, button_name)}' for: {', '.join(actions)}"
+                    )
 
                 dpad_map = {"up": "none", "right": "none", "down": "none", "left": "none"}
                 for action_name, direction in selected_dirs.items():
                     if direction in dpad_map:
                         dpad_map[direction] = action_name
+                button_map = {name: "none" for name in XBOX_BUTTON_ORDER}
+                for action_name, button_name in selected_buttons.items():
+                    if button_name in button_map:
+                        button_map[button_name] = action_name
 
                 new_cfg = ControllerConfig(
                     enabled=enabled_var.get(),
+                    keyboard_enabled=keyboard_enabled_var.get(),
                     device_index=int(device_var.get().strip() or "0"),
                     hat_index=int(hat_var.get().strip() or "0"),
                     repeat_guard_ms=int(guard_var.get().strip() or "150"),
                     dpad_map=dpad_map,
                     keyboard_map=keyboard_map,
+                    button_map=button_map,
                 )
                 save_controller_config(self.controller_config_path, new_cfg, self.log)
                 self.controller_config = load_controller_config(self.controller_config_path, self.log)
-                self.hotkeys.reload_bindings(self.controller_config.keyboard_map)
+                self.hotkeys.reload_bindings(
+                    self.controller_config.keyboard_map,
+                    enabled=self.controller_config.keyboard_enabled,
+                )
                 self.controller.reload(self.controller_config)
                 self._bind_local_hotkeys()
                 self._refresh_action_button_labels()
@@ -707,7 +762,7 @@ class D2RunnerApp:
                 self.status_var.set(f"Settings save failed: {exc}")
 
         buttons = tk.Frame(frame)
-        buttons.grid(row=row, column=0, columnspan=3, sticky="e", pady=(6, 0))
+        buttons.grid(row=row, column=0, columnspan=4, sticky="e", pady=(6, 0))
         tk.Button(buttons, text="Cancel", command=win.destroy).pack(side="left")
         tk.Button(buttons, text="Save", command=_save_and_close).pack(side="left", padx=(6, 0))
 
@@ -731,6 +786,17 @@ class D2RunnerApp:
         for direction, actions in seen.items():
             if len(actions) > 1:
                 return direction, actions
+        return None
+
+    def _find_duplicate_controller_buttons(self, selected_buttons: dict[str, str]) -> tuple[str, list[str]] | None:
+        seen: dict[str, list[str]] = {}
+        for action, button_name in selected_buttons.items():
+            if button_name == "none":
+                continue
+            seen.setdefault(button_name, []).append(ACTION_TITLES.get(action, action))
+        for button_name, actions in seen.items():
+            if len(actions) > 1:
+                return button_name, actions
         return None
 
     def _log_local_keypress(self, event: tk.Event) -> None:

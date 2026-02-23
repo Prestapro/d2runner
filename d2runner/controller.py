@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import json
 import logging
@@ -20,15 +20,43 @@ VALID_ACTIONS = {
     "none",
 }
 
+XBOX_BUTTON_ORDER = (
+    "a",
+    "b",
+    "x",
+    "y",
+    "lb",
+    "rb",
+    "back",
+    "start",
+    "left_stick",
+    "right_stick",
+)
+
+XBOX_BUTTON_LABELS = {
+    "a": "A",
+    "b": "B",
+    "x": "X",
+    "y": "Y",
+    "lb": "LB",
+    "rb": "RB",
+    "back": "Back/View",
+    "start": "Start/Menu",
+    "left_stick": "L3 (Left Stick Click)",
+    "right_stick": "R3 (Right Stick Click)",
+}
+
 
 @dataclass
 class ControllerConfig:
     enabled: bool
+    keyboard_enabled: bool
     device_index: int
     hat_index: int
     dpad_map: dict[str, str]
     keyboard_map: dict[str, str]
     repeat_guard_ms: int = 150
+    button_map: dict[str, str] = field(default_factory=dict)
 
 
 def default_controller_config_data() -> dict[str, object]:
@@ -50,6 +78,7 @@ def default_controller_config_data() -> dict[str, object]:
         }
     return {
         "enabled": True,
+        "keyboard_enabled": True,
         "device_index": 0,
         "hat_index": 0,
         "repeat_guard_ms": 150,
@@ -60,6 +89,7 @@ def default_controller_config_data() -> dict[str, object]:
             "down": "reset_timer",
             "left": "reset_session",
         },
+        "button_map": {name: "none" for name in XBOX_BUTTON_ORDER},
     }
 
 
@@ -92,22 +122,40 @@ def load_controller_config(config_path: Path, log: logging.Logger | None = None)
             action = "none"
         dpad_map[direction] = action
 
+    button_map_raw = raw.get("button_map", {})
+    button_map: dict[str, str] = {}
+    for button_name in XBOX_BUTTON_ORDER:
+        action = str(button_map_raw.get(button_name, "none"))
+        if action not in VALID_ACTIONS:
+            logger.warning(
+                "controller_config_invalid_button_action button=%s action=%s fallback=none path=%s",
+                button_name,
+                action,
+                config_path,
+            )
+            action = "none"
+        button_map[button_name] = action
+
     cfg = ControllerConfig(
         enabled=bool(raw.get("enabled", True)),
+        keyboard_enabled=bool(raw.get("keyboard_enabled", True)),
         device_index=int(raw.get("device_index", 0)),
         hat_index=int(raw.get("hat_index", 0)),
         repeat_guard_ms=int(raw.get("repeat_guard_ms", 150)),
         dpad_map=dpad_map,
         keyboard_map=keyboard_map,
+        button_map=button_map,
     )
     logger.info(
-        "controller_config_loaded path=%s enabled=%s device_index=%s hat_index=%s keyboard_map=%s dpad_map=%s",
+        "controller_config_loaded path=%s enabled=%s keyboard_enabled=%s device_index=%s hat_index=%s keyboard_map=%s dpad_map=%s button_map=%s",
         config_path,
         cfg.enabled,
+        cfg.keyboard_enabled,
         cfg.device_index,
         cfg.hat_index,
         cfg.keyboard_map,
         cfg.dpad_map,
+        cfg.button_map,
     )
     return cfg
 
@@ -117,6 +165,7 @@ def save_controller_config(config_path: Path, config: ControllerConfig, log: log
     logger = log or logging.getLogger("d2runner.controller")
     payload = {
         "enabled": config.enabled,
+        "keyboard_enabled": config.keyboard_enabled,
         "device_index": config.device_index,
         "hat_index": config.hat_index,
         "repeat_guard_ms": config.repeat_guard_ms,
@@ -133,14 +182,17 @@ def save_controller_config(config_path: Path, config: ControllerConfig, log: log
             "down": config.dpad_map.get("down", "none"),
             "left": config.dpad_map.get("left", "none"),
         },
+        "button_map": {name: config.button_map.get(name, "none") for name in XBOX_BUTTON_ORDER},
     }
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     logger.info(
-        "controller_config_saved path=%s keyboard_map=%s dpad_map=%s",
+        "controller_config_saved path=%s keyboard_enabled=%s keyboard_map=%s dpad_map=%s button_map=%s",
         config_path,
+        payload["keyboard_enabled"],
         payload["keyboard_map"],
         payload["dpad_map"],
+        payload["button_map"],
     )
 
 
@@ -220,6 +272,7 @@ class ControllerBackend:
             )
             has_hat = joystick.get_numhats() > self.config.hat_index
             button_dpad_map = self._guess_dpad_button_map(joystick.get_numbuttons())
+            named_button_map = self._guess_named_button_map(joystick.get_numbuttons())
             axis_dpad_pair = self._guess_dpad_axis_pair(joystick.get_numaxes())
             if not has_hat and button_dpad_map is None and axis_dpad_pair is None:
                 self.error = (
@@ -236,6 +289,7 @@ class ControllerBackend:
                 button_dpad_map,
                 axis_dpad_pair,
             )
+            self.log.info("controller_named_button_sources button_map=%s", named_button_map)
 
             xinput = self._try_init_xinput(self.config.device_index)
             if xinput is not None:
@@ -249,11 +303,13 @@ class ControllerBackend:
             prev_axes_direction: str | None = None
             prev_buttons_pressed: set[int] = set()
             prev_all_buttons_pressed: set[int] = set()
+            prev_named_buttons_pressed: set[str] = set()
             pump_failed_logged = False
             prev_xinput_buttons: int | None = None
 
             while not self._stop.is_set():
                 direction: str | None = None
+                button_name: str | None = None
 
                 # SDL-backed joystick state is refreshed by pumping the event queue.
                 # Without this, hat/button/axis values may remain stuck at startup.
@@ -265,12 +321,14 @@ class ControllerBackend:
                         self.log.warning("controller_event_pump_failed %s", exc)
 
                 if xinput is not None:
-                    xinput_direction, prev_xinput_buttons = self._poll_xinput_dpad(
+                    xinput_direction, xinput_button_name, prev_xinput_buttons = self._poll_xinput_inputs(
                         xinput,
                         prev_xinput_buttons,
                     )
                     if xinput_direction is not None:
                         direction = xinput_direction
+                    if xinput_button_name is not None:
+                        button_name = xinput_button_name
 
                 if direction is None and has_hat:
                     try:
@@ -303,6 +361,13 @@ class ControllerBackend:
                     )
                     direction = buttons_direction
 
+                if button_name is None and named_button_map is not None:
+                    button_name, prev_named_buttons_pressed = self._poll_named_buttons(
+                        joystick,
+                        named_button_map,
+                        prev_named_buttons_pressed,
+                    )
+
                 if direction is not None:
                     action = self.config.dpad_map.get(direction, "none")
                     if action == "none":
@@ -311,6 +376,15 @@ class ControllerBackend:
                         self.log.info("controller_direction_throttled direction=%s action=%s", direction, action)
                     else:
                         self.log.info("controller_action direction=%s action=%s", direction, action)
+                        self.on_action(action)
+                if button_name is not None:
+                    action = self.config.button_map.get(button_name, "none")
+                    if action == "none":
+                        self.log.info("controller_button_ignored button=%s", button_name)
+                    elif self._should_throttle(f"button:{button_name}"):
+                        self.log.info("controller_button_throttled button=%s action=%s", button_name, action)
+                    else:
+                        self.log.info("controller_button_action button=%s action=%s", button_name, action)
                         self.on_action(action)
                 time.sleep(0.01)
         except Exception as exc:  # pragma: no cover
@@ -352,6 +426,24 @@ class ControllerBackend:
         if num_axes >= 8:
             return (6, 7)
         return None
+
+    @staticmethod
+    def _guess_named_button_map(num_buttons: int) -> dict[str, int] | None:
+        # Common SDL/Xbox layout in pygame joystick mode.
+        mapping = {
+            "a": 0,
+            "b": 1,
+            "x": 2,
+            "y": 3,
+            "lb": 4,
+            "rb": 5,
+            "back": 6,
+            "start": 7,
+            "left_stick": 9 if num_buttons > 9 else 8,
+            "right_stick": 10 if num_buttons > 10 else 9,
+        }
+        usable = {name: idx for name, idx in mapping.items() if idx < num_buttons}
+        return usable or None
 
     def _poll_axes_dpad(self, joystick, axis_pair: tuple[int, int]) -> str | None:
         ax_x, ax_y = axis_pair
@@ -423,6 +515,36 @@ class ControllerBackend:
             )
         return pressed_now
 
+    def _poll_named_buttons(
+        self,
+        joystick,
+        button_map: dict[str, int],
+        prev_pressed: set[str],
+    ) -> tuple[str | None, set[str]]:
+        pressed_now: set[str] = set()
+        for name, idx in button_map.items():
+            try:
+                if joystick.get_button(idx):
+                    pressed_now.add(name)
+            except Exception:
+                continue
+
+        if pressed_now != prev_pressed:
+            self.log.info(
+                "controller_named_button_debug pressed=%s released=%s raw_pressed=%s",
+                sorted(pressed_now - prev_pressed),
+                sorted(prev_pressed - pressed_now),
+                sorted(pressed_now),
+            )
+
+        for name in XBOX_BUTTON_ORDER:
+            if name in pressed_now and name not in prev_pressed:
+                return name, pressed_now
+        for name in sorted(pressed_now):
+            if name not in prev_pressed:
+                return name, pressed_now
+        return None, pressed_now
+
     def _should_throttle(self, direction: str) -> bool:
         now = time.monotonic()
         last = self._last_fired_at.get(direction)
@@ -475,19 +597,19 @@ class ControllerBackend:
 
         return XINPUT_STATE
 
-    def _poll_xinput_dpad(
+    def _poll_xinput_inputs(
         self,
         xinput: dict[str, object],
         prev_buttons: int | None,
-    ) -> tuple[str | None, int | None]:
+    ) -> tuple[str | None, str | None, int | None]:
         xstate = self._xinput_state_struct()
         state = xstate()
         try:
             rc = int(xinput["get_state"](int(xinput["user_index"]), ctypes.byref(state)))  # type: ignore[index]
         except Exception:
-            return None, prev_buttons
+            return None, None, prev_buttons
         if rc != 0:
-            return None, prev_buttons
+            return None, None, prev_buttons
 
         buttons = int(state.Gamepad.wButtons)
         if prev_buttons != buttons:
@@ -502,6 +624,7 @@ class ControllerBackend:
         )
 
         direction: str | None = None
+        button_name: str | None = None
         if prev_buttons is None:
             prev_buttons = 0
         newly_pressed = buttons & ~prev_buttons
@@ -509,4 +632,20 @@ class ControllerBackend:
             if newly_pressed & mask:
                 direction = name
                 break
-        return direction, buttons
+        xinput_buttons = (
+            (0x1000, "a"),
+            (0x2000, "b"),
+            (0x4000, "x"),
+            (0x8000, "y"),
+            (0x0100, "lb"),
+            (0x0200, "rb"),
+            (0x0020, "back"),
+            (0x0010, "start"),
+            (0x0040, "left_stick"),
+            (0x0080, "right_stick"),
+        )
+        for mask, name in xinput_buttons:
+            if newly_pressed & mask:
+                button_name = name
+                break
+        return direction, button_name, buttons
