@@ -205,37 +205,73 @@ class ControllerBackend:
                 joystick.get_numbuttons(),
                 joystick.get_numaxes(),
             )
-            if joystick.get_numhats() <= self.config.hat_index:
+            has_hat = joystick.get_numhats() > self.config.hat_index
+            button_dpad_map = self._guess_dpad_button_map(joystick.get_numbuttons())
+            axis_dpad_pair = self._guess_dpad_axis_pair(joystick.get_numaxes())
+            if not has_hat and button_dpad_map is None and axis_dpad_pair is None:
                 self.error = (
-                    f"controller hat not found at index {self.config.hat_index} "
-                    f"(hats={joystick.get_numhats()})"
+                    f"controller dpad not available (hats={joystick.get_numhats()}, "
+                    f"buttons={joystick.get_numbuttons()}, axes={joystick.get_numaxes()})"
                 )
-                self.log.warning("controller_hat_not_found %s", self.error)
+                self.log.warning("controller_dpad_not_available %s", self.error)
                 return
 
+            self.log.info(
+                "controller_dpad_sources hat=%s hat_index=%s button_map=%s axis_pair=%s",
+                has_hat,
+                self.config.hat_index,
+                button_dpad_map,
+                axis_dpad_pair,
+            )
+
             prev_hat_value: tuple[int, int] | None = None
+            prev_axes_direction: str | None = None
+            prev_buttons_pressed: set[int] = set()
+            prev_all_buttons_pressed: set[int] = set()
 
             while not self._stop.is_set():
-                try:
-                    value = joystick.get_hat(self.config.hat_index)
-                except Exception as exc:
-                    self.error = f"controller hat polling failed: {exc}"
-                    self.log.exception("controller_hat_poll_failed")
-                    return
+                direction: str | None = None
 
-                if value != prev_hat_value:
-                    prev_hat_value = value
-                    self.log.info("controller_hat_motion hat=%s value=%s", self.config.hat_index, value)
-                    direction = self._direction_from_hat(value)
-                    if direction is not None:
-                        action = self.config.dpad_map.get(direction, "none")
-                        if action == "none":
-                            self.log.info("controller_direction_ignored direction=%s", direction)
-                        elif self._should_throttle(direction):
-                            self.log.info("controller_direction_throttled direction=%s action=%s", direction, action)
-                        else:
-                            self.log.info("controller_action direction=%s action=%s", direction, action)
-                            self.on_action(action)
+                if has_hat:
+                    try:
+                        value = joystick.get_hat(self.config.hat_index)
+                    except Exception as exc:
+                        self.error = f"controller hat polling failed: {exc}"
+                        self.log.exception("controller_hat_poll_failed")
+                        return
+                    if value != prev_hat_value:
+                        prev_hat_value = value
+                        self.log.info("controller_hat_motion hat=%s value=%s", self.config.hat_index, value)
+                        direction = self._direction_from_hat(value)
+
+                if direction is None and axis_dpad_pair is not None:
+                    axes_direction = self._poll_axes_dpad(joystick, axis_dpad_pair)
+                    if axes_direction != prev_axes_direction:
+                        self.log.info("controller_axes_dpad axis_pair=%s direction=%s", axis_dpad_pair, axes_direction)
+                        prev_axes_direction = axes_direction
+                        direction = axes_direction
+
+                if direction is None and button_dpad_map is not None:
+                    prev_all_buttons_pressed = self._poll_all_buttons_debug(
+                        joystick,
+                        prev_all_buttons_pressed,
+                    )
+                    buttons_direction, prev_buttons_pressed = self._poll_buttons_dpad(
+                        joystick,
+                        button_dpad_map,
+                        prev_buttons_pressed,
+                    )
+                    direction = buttons_direction
+
+                if direction is not None:
+                    action = self.config.dpad_map.get(direction, "none")
+                    if action == "none":
+                        self.log.info("controller_direction_ignored direction=%s", direction)
+                    elif self._should_throttle(direction):
+                        self.log.info("controller_direction_throttled direction=%s action=%s", direction, action)
+                    else:
+                        self.log.info("controller_action direction=%s action=%s", direction, action)
+                        self.on_action(action)
                 time.sleep(0.01)
         except Exception as exc:  # pragma: no cover
             self.error = f"controller backend failed: {exc}"
@@ -262,6 +298,90 @@ class ControllerBackend:
         if (x, y) == (-1, 0):
             return "left"
         return None
+
+    @staticmethod
+    def _guess_dpad_button_map(num_buttons: int) -> dict[int, str] | None:
+        # Common Xbox/XInput layouts in SDL/pygame joystick mode map D-pad to buttons 11..14.
+        if num_buttons >= 15:
+            return {11: "up", 12: "down", 13: "left", 14: "right"}
+        return None
+
+    @staticmethod
+    def _guess_dpad_axis_pair(num_axes: int) -> tuple[int, int] | None:
+        # Some Windows drivers expose D-pad as discrete axes 6/7 (-1,0,1).
+        if num_axes >= 8:
+            return (6, 7)
+        return None
+
+    def _poll_axes_dpad(self, joystick, axis_pair: tuple[int, int]) -> str | None:
+        ax_x, ax_y = axis_pair
+        try:
+            x = float(joystick.get_axis(ax_x))
+            y = float(joystick.get_axis(ax_y))
+        except Exception:
+            return None
+        threshold = 0.5
+        qx = -1 if x < -threshold else (1 if x > threshold else 0)
+        qy = -1 if y < -threshold else (1 if y > threshold else 0)
+        if (qx, qy) == (0, 0):
+            return None
+        if (qx, qy) == (0, -1):
+            return "up"
+        if (qx, qy) == (1, 0):
+            return "right"
+        if (qx, qy) == (0, 1):
+            return "down"
+        if (qx, qy) == (-1, 0):
+            return "left"
+        return None
+
+    def _poll_buttons_dpad(
+        self,
+        joystick,
+        button_map: dict[int, str],
+        prev_pressed: set[int],
+    ) -> tuple[str | None, set[int]]:
+        pressed_now: set[int] = set()
+        for btn_idx in button_map:
+            try:
+                if joystick.get_button(btn_idx):
+                    pressed_now.add(btn_idx)
+            except Exception:
+                continue
+
+        if pressed_now != prev_pressed:
+            self.log.info(
+                "controller_button_dpad pressed=%s released=%s raw_pressed=%s map=%s",
+                sorted(pressed_now - prev_pressed),
+                sorted(prev_pressed - pressed_now),
+                sorted(pressed_now),
+                button_map,
+            )
+
+        newly_pressed = [i for i in sorted(pressed_now) if i not in prev_pressed]
+        direction = button_map[newly_pressed[0]] if newly_pressed else None
+        return direction, pressed_now
+
+    def _poll_all_buttons_debug(self, joystick, prev_pressed: set[int]) -> set[int]:
+        try:
+            count = int(joystick.get_numbuttons())
+        except Exception:
+            return prev_pressed
+        pressed_now: set[int] = set()
+        for idx in range(count):
+            try:
+                if joystick.get_button(idx):
+                    pressed_now.add(idx)
+            except Exception:
+                continue
+        if pressed_now != prev_pressed:
+            self.log.info(
+                "controller_button_debug pressed=%s released=%s raw_pressed=%s",
+                sorted(pressed_now - prev_pressed),
+                sorted(prev_pressed - pressed_now),
+                sorted(pressed_now),
+            )
+        return pressed_now
 
     def _should_throttle(self, direction: str) -> bool:
         now = time.monotonic()

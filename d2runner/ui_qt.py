@@ -13,7 +13,7 @@ from .hotkeys import ACTION_ORDER, ACTION_TITLES, HotkeyBackend, human_combo_lab
 
 def _qt_imports():
     from PySide6.QtCore import QTimer, Qt
-    from PySide6.QtGui import QColor, QKeySequence, QShortcut
+    from PySide6.QtGui import QAction, QColor, QKeySequence, QShortcut
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -28,13 +28,17 @@ def _qt_imports():
         QLabel,
         QLineEdit,
         QMessageBox,
+        QMenu,
         QPushButton,
         QSpinBox,
+        QStyle,
+        QSystemTrayIcon,
         QVBoxLayout,
         QWidget,
     )
 
     return {
+        "QAction": QAction,
         "QApplication": QApplication,
         "QCheckBox": QCheckBox,
         "QColor": QColor,
@@ -50,9 +54,12 @@ def _qt_imports():
         "QLabel": QLabel,
         "QLineEdit": QLineEdit,
         "QMessageBox": QMessageBox,
+        "QMenu": QMenu,
         "QPushButton": QPushButton,
         "QShortcut": QShortcut,
         "QSpinBox": QSpinBox,
+        "QStyle": QStyle,
+        "QSystemTrayIcon": QSystemTrayIcon,
         "QTimer": QTimer,
         "Qt": Qt,
         "QVBoxLayout": QVBoxLayout,
@@ -113,6 +120,7 @@ class D2RunnerQtApp:
         self.Qt = self.qt["Qt"]
         self.QApplication = self.qt["QApplication"]
         self.QWidget = self.qt["QWidget"]
+        self.QAction = self.qt["QAction"]
         self.QVBoxLayout = self.qt["QVBoxLayout"]
         self.QHBoxLayout = self.qt["QHBoxLayout"]
         self.QGridLayout = self.qt["QGridLayout"]
@@ -128,7 +136,10 @@ class D2RunnerQtApp:
         self.QComboBox = self.qt["QComboBox"]
         self.QCheckBox = self.qt["QCheckBox"]
         self.QColor = self.qt["QColor"]
+        self.QMenu = self.qt["QMenu"]
         self.QSpinBox = self.qt["QSpinBox"]
+        self.QStyle = self.qt["QStyle"]
+        self.QSystemTrayIcon = self.qt["QSystemTrayIcon"]
         self.QKeySequenceEdit = self.qt["QKeySequenceEdit"]
         self.QMessageBox = self.qt["QMessageBox"]
 
@@ -155,17 +166,22 @@ class D2RunnerQtApp:
         self.window.setWindowFlag(self.Qt.WindowStaysOnTopHint, True)
         self.window.setMinimumWidth(560)
         self.window.setObjectName("MainWindow")
-        if self.overlay_mode == "compact":
-            self.window.setMinimumWidth(400)
+        if self.overlay_mode in {"compact", "mini"}:
+            self.window.setMinimumWidth(320)
             try:
-                self.window.setWindowOpacity(0.94)
+                self.window.setWindowOpacity(0.5 if self.overlay_mode == "compact" else 0.94)
                 self.window.setWindowFlag(self.Qt.Tool, True)
             except Exception:
                 pass
 
         self._qt_shortcuts: list[object] = []
+        self._tray = None
+        self._tray_enabled = False
+        self._quitting = False
+        self._default_min_width = 560
         self._build_theme()
         self._build_ui()
+        self._setup_tray()
         self._apply_overlay_mode()
         self._rebuild_qt_shortcuts()
         self._update_labels()
@@ -177,11 +193,67 @@ class D2RunnerQtApp:
         self.ui_timer.start(100)
 
     def _apply_overlay_mode(self) -> None:
-        if self.overlay_mode != "compact":
-            return
-        self.log.info("qt_overlay_mode_enabled mode=compact")
+        # Reset visibility first, then apply mode-specific hiding.
+        self.window.setMinimumWidth(self._default_min_width)
         try:
-            self.window.resize(420, 250)
+            self.window.setMinimumSize(0, 0)
+            self.window.setMaximumSize(16777215, 16777215)
+            self.window.setWindowOpacity(1.0)
+        except Exception:
+            pass
+        try:
+            self.card_layout.setContentsMargins(16, 16, 16, 16)
+            self.card_layout.setSpacing(12)
+        except Exception:
+            pass
+        self.run_label.setStyleSheet("font-weight: 700; font-size: 16px;")
+        self.timer_label.setStyleSheet("")
+        for w in [
+            self.session_card,
+            self.timer_card,
+            self.compact_panel,
+            self.run_label,
+            self.session_label,
+            self.csv_label,
+            self.limit_label,
+            self.timer_label,
+            self.state_chip,
+            self.note_label,
+            self.note_entry,
+            self.btn_start_stop,
+            self.btn_next_run,
+            self.btn_reset_timer,
+            self.btn_reset_session,
+            self.btn_undo,
+            self.btn_settings,
+            self.btn_hide_tray,
+            self.btn_mini_mode,
+            self.status_label,
+            self.help_label,
+        ]:
+            try:
+                w.show()
+            except Exception:
+                pass
+
+        if self.overlay_mode not in {"compact", "mini"}:
+            try:
+                self.window.resize(max(self.window.width(), 560), max(self.window.height(), 360))
+            except Exception:
+                pass
+            return
+
+        self.log.info("qt_overlay_mode_enabled mode=%s", self.overlay_mode)
+        try:
+            if self.overlay_mode == "mini":
+                self.window.setMinimumWidth(255)
+                self.window.setWindowOpacity(0.75)
+                self.window.setFixedSize(255, 105)
+            else:
+                # Compact mode: fixed tiny overlay (run number + timer only).
+                self.window.setMinimumWidth(100)
+                self.window.setWindowOpacity(0.5)
+                self.window.setFixedSize(100, 50)
         except Exception:
             pass
 
@@ -191,22 +263,107 @@ class D2RunnerQtApp:
             except Exception:
                 pass
 
-        try:
-            note_parent = self.note_entry.parentWidget()
-            if note_parent is not None:
-                note_parent.hide()
-        except Exception:
-            pass
-
-        # Keep core actions visible; hide less-used controls to reduce obstruction.
-        for w in [self.btn_reset_timer, self.btn_undo, self.btn_settings]:
+        if self.overlay_mode in {"compact", "mini"}:
+            # Tiny overlay modes: dedicated compact panel to guarantee exact size.
             try:
-                w.hide()
+                self.card_layout.setContentsMargins(1, 1, 1, 1)
+                self.card_layout.setSpacing(0)
             except Exception:
                 pass
+            if self.overlay_mode == "compact":
+                self.compact_run_label.setStyleSheet("font-weight: 700; font-size: 7px;")
+                self.compact_timer_label.setStyleSheet("font-size: 11px; font-weight: 700;")
+                try:
+                    self.compact_layout.setContentsMargins(3, 2, 3, 2)
+                    self.compact_layout.setSpacing(0)
+                except Exception:
+                    pass
+            else:
+                self.compact_run_label.setStyleSheet("font-weight: 700; font-size: 15px;")
+                self.compact_timer_label.setStyleSheet("font-size: 26px; font-weight: 700;")
+                try:
+                    self.compact_layout.setContentsMargins(9, 6, 9, 6)
+                    self.compact_layout.setSpacing(2)
+                except Exception:
+                    pass
+            for w in [
+                self.session_card,
+                self.timer_card,
+                self.session_label,
+                self.csv_label,
+                self.limit_label,
+                self.state_chip,
+                self.note_label,
+                self.note_entry,
+                self.btn_start_stop,
+                self.btn_next_run,
+                self.btn_reset_timer,
+                self.btn_reset_session,
+                self.btn_undo,
+                self.btn_settings,
+                self.btn_hide_tray,
+                self.btn_mini_mode,
+                self.status_label,
+                self.help_label,
+            ]:
+                try:
+                    w.hide()
+                except Exception:
+                    pass
+            try:
+                self.compact_panel.show()
+            except Exception:
+                pass
+        else:
+            # Legacy overlay branch (currently unused for compact/mini).
+            for w in [
+                self.compact_panel,
+                self.limit_label,
+                self.state_chip,
+                self.note_label,
+                self.note_entry,
+                self.btn_start_stop,
+                self.btn_next_run,
+                self.btn_reset_timer,
+                self.btn_reset_session,
+                self.btn_undo,
+                self.btn_settings,
+                self.btn_hide_tray,
+                self.btn_mini_mode,
+                self.status_label,
+                self.help_label,
+            ]:
+                try:
+                    w.hide()
+                except Exception:
+                    pass
+
+        # Compact keeps primary actions visible; hide less-used controls to reduce obstruction.
+        if self.overlay_mode == "compact":
+            pass
+        else:
+            for w in []:
+                try:
+                    w.hide()
+                except Exception:
+                    pass
+
+    def _set_overlay_mode(self, mode: str) -> None:
+        mode = mode if mode in {"off", "compact", "mini"} else "off"
+        self.overlay_mode = mode
+        self._apply_overlay_mode()
+        self._update_labels()
+        self._update_control_states()
+        self._refresh_visual_state()
+        if self.window.isVisible():
+            self._position_overlay()
+        self.log.info("qt_overlay_mode_switched mode=%s", mode)
+
+    def _toggle_mini_mode(self) -> None:
+        self._set_overlay_mode("off" if self.overlay_mode == "mini" else "mini")
 
     def _position_overlay(self) -> None:
-        if self.overlay_mode != "compact":
+        if self.overlay_mode not in {"compact", "mini"}:
             return
         try:
             screen = self.window.screen() or self.qt_app.primaryScreen()
@@ -509,6 +666,7 @@ class D2RunnerQtApp:
         self.card.setObjectName("Card")
         self._apply_shadow(self.card, blur=40, y=8, alpha=30)
         card_layout = self.QVBoxLayout(self.card)
+        self.card_layout = card_layout
         card_layout.setContentsMargins(16, 16, 16, 16)
         card_layout.setSpacing(12)
         vbox.addWidget(self.card)
@@ -551,11 +709,27 @@ class D2RunnerQtApp:
         self.state_chip.setAlignment(self.Qt.AlignLeft)
         timer_layout.addWidget(self.state_chip, 0, self.Qt.AlignLeft)
 
+        self.compact_panel = self.QFrame()
+        self.compact_panel.setObjectName("TimerCard")
+        compact_layout = self.QVBoxLayout(self.compact_panel)
+        self.compact_layout = compact_layout
+        compact_layout.setContentsMargins(3, 2, 3, 2)
+        compact_layout.setSpacing(0)
+        self.compact_run_label = self.QLabel("Run #1")
+        self.compact_run_label.setStyleSheet("font-weight: 700; font-size: 7px;")
+        compact_layout.addWidget(self.compact_run_label)
+        self.compact_timer_label = self.QLabel("00:00.00")
+        self.compact_timer_label.setObjectName("Timer")
+        self.compact_timer_label.setStyleSheet("font-size: 11px; font-weight: 700;")
+        compact_layout.addWidget(self.compact_timer_label)
+        self.compact_panel.hide()
+        card_layout.addWidget(self.compact_panel)
+
         note_row = self.QHBoxLayout()
         note_row.setSpacing(8)
-        note_lbl = self.QLabel("Note")
-        note_lbl.setStyleSheet("font-size: 13px; font-weight: 500; color: rgba(29,29,31,204);")
-        note_row.addWidget(note_lbl)
+        self.note_label = self.QLabel("Note")
+        self.note_label.setStyleSheet("font-size: 13px; font-weight: 500; color: rgba(29,29,31,204);")
+        note_row.addWidget(self.note_label)
         self.note_entry = self.QLineEdit()
         self.note_entry.setPlaceholderText("Optional drop / note")
         note_row.addWidget(self.note_entry, 1)
@@ -588,6 +762,12 @@ class D2RunnerQtApp:
         self.btn_settings = self.QPushButton("Settings")
         self.btn_settings.clicked.connect(self._open_settings_dialog)  # type: ignore[attr-defined]
         row2.addWidget(self.btn_settings)
+        self.btn_hide_tray = self.QPushButton("Hide to Tray")
+        self.btn_hide_tray.clicked.connect(self._hide_to_tray)  # type: ignore[attr-defined]
+        row2.addWidget(self.btn_hide_tray)
+        self.btn_mini_mode = self.QPushButton("Mini Mode")
+        self.btn_mini_mode.clicked.connect(self._toggle_mini_mode)  # type: ignore[attr-defined]
+        row2.addWidget(self.btn_mini_mode)
         row2.addStretch(1)
         card_layout.addLayout(row2)
 
@@ -602,6 +782,93 @@ class D2RunnerQtApp:
         card_layout.addWidget(self.help_label)
 
         self._refresh_action_button_labels()
+
+    def _setup_tray(self) -> None:
+        try:
+            if not self.QSystemTrayIcon.isSystemTrayAvailable():
+                self.log.warning("system_tray_unavailable")
+                return
+            icon = self.window.windowIcon()
+            if icon.isNull():
+                icon = self.qt_app.style().standardIcon(self.QStyle.SP_ComputerIcon)
+            tray = self.QSystemTrayIcon(icon, self.window)
+            tray.setToolTip("D2 Runner")
+
+            menu = self.QMenu()
+            act_show = self.QAction("Show Window", menu)
+            act_hide = self.QAction("Hide to Tray", menu)
+            act_view_normal = self.QAction("Normal View", menu)
+            act_view_compact = self.QAction("Compact View", menu)
+            act_view_mini = self.QAction("Mini View", menu)
+            act_quit = self.QAction("Quit", menu)
+            act_show.triggered.connect(self._show_from_tray)  # type: ignore[attr-defined]
+            act_hide.triggered.connect(self._hide_to_tray)  # type: ignore[attr-defined]
+            act_view_normal.triggered.connect(lambda: self._set_overlay_mode("off"))  # type: ignore[attr-defined]
+            act_view_compact.triggered.connect(lambda: self._set_overlay_mode("compact"))  # type: ignore[attr-defined]
+            act_view_mini.triggered.connect(lambda: self._set_overlay_mode("mini"))  # type: ignore[attr-defined]
+            act_quit.triggered.connect(self._quit_from_tray)  # type: ignore[attr-defined]
+            menu.addAction(act_show)
+            menu.addAction(act_hide)
+            menu.addSeparator()
+            menu.addAction(act_view_normal)
+            menu.addAction(act_view_compact)
+            menu.addAction(act_view_mini)
+            menu.addSeparator()
+            menu.addAction(act_quit)
+            tray.setContextMenu(menu)
+            tray.activated.connect(self._on_tray_activated)  # type: ignore[attr-defined]
+            tray.show()
+            self._tray = tray
+            self._tray_enabled = True
+            self.log.info("system_tray_enabled")
+        except Exception:
+            self.log.exception("system_tray_setup_failed")
+            self._tray = None
+            self._tray_enabled = False
+
+    def _hide_to_tray(self) -> None:
+        if not self._tray_enabled:
+            self.log.warning("hide_to_tray_requested_but_unavailable")
+            self.status_label.setText("System tray unavailable on this system.")
+            self._refresh_visual_state()
+            return
+        self.window.hide()
+        try:
+            self._tray.showMessage("D2 Runner", "Running in tray. Use tray icon to restore.")
+        except Exception:
+            pass
+        self.log.info("window_hidden_to_tray")
+
+    def _show_from_tray(self) -> None:
+        try:
+            self.window.show()
+            self.window.raise_()
+            self.window.activateWindow()
+            self._position_overlay()
+            self.log.info("window_restored_from_tray")
+        except Exception:
+            self.log.exception("window_restore_from_tray_failed")
+
+    def _toggle_tray_visibility(self) -> None:
+        if self.window.isVisible():
+            self._hide_to_tray()
+        else:
+            self._show_from_tray()
+
+    def _on_tray_activated(self, reason) -> None:
+        # Trigger/DoubleClick behavior varies by OS; accept both.
+        try:
+            trigger = self.QSystemTrayIcon.Trigger
+            double_click = self.QSystemTrayIcon.DoubleClick
+            if reason in (trigger, double_click):
+                self._toggle_tray_visibility()
+        except Exception:
+            self.log.exception("tray_activate_handler_failed")
+
+    def _quit_from_tray(self) -> None:
+        self._quitting = True
+        self.log.info("quit_requested_from_tray")
+        self.qt_app.quit()
 
     def _apply_shadow(self, widget, blur: int, y: int, alpha: int) -> None:
         try:
@@ -659,12 +926,16 @@ class D2RunnerQtApp:
 
     def _update_labels(self) -> None:
         self.run_label.setText(f"Run #{self.tracker.run_number}")
+        self.compact_run_label.setText(f"Run #{self.tracker.run_number}")
         self.session_label.setText(f"Session {self.tracker.session_id}")
         self.csv_label.setText(f"CSV {self.current_csv_path.name}")
         self.limit_label.setText(self._limit_text())
         self.timer_label.setText(self.tracker.formatted_elapsed())
+        self.compact_timer_label.setText(self.tracker.formatted_elapsed())
         state = "Running" if self.tracker.is_running else (self.state_chip.text() or "Idle")
         self.state_chip.setText(state)
+        if hasattr(self, "btn_mini_mode"):
+            self.btn_mini_mode.setText("Normal View" if self.overlay_mode == "mini" else "Mini Mode")
 
     def _update_control_states(self) -> None:
         blocked = self._run_limit_reached()
@@ -672,6 +943,10 @@ class D2RunnerQtApp:
             w.setEnabled(not blocked)
         self.btn_reset_session.setEnabled(True)
         self.btn_settings.setEnabled(True)
+        if hasattr(self, "btn_hide_tray"):
+            self.btn_hide_tray.setEnabled(True)
+        if hasattr(self, "btn_mini_mode"):
+            self.btn_mini_mode.setEnabled(True)
         self.limit_label.setText(self._limit_text())
 
     def _refresh_visual_state(self) -> None:
@@ -1088,5 +1363,10 @@ class D2RunnerQtApp:
         try:
             self.qt_app.exec()
         finally:
+            if self._tray is not None:
+                try:
+                    self._tray.hide()
+                except Exception:
+                    pass
             self.hotkeys.stop()
             self.controller.stop()

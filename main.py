@@ -30,8 +30,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--overlay",
         default="off",
-        choices=["off", "compact"],
-        help="Overlay mode (Qt UI): off or compact",
+        choices=["off", "compact", "mini"],
+        help="Overlay mode (Qt UI): off, compact, or mini (run+timer only)",
     )
     return parser.parse_args()
 

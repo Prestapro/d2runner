@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -39,6 +39,13 @@ jobs:
           pip install -r requirements.txt
           pip install -r requirements-build.txt
 
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-build.txt
+
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -47,6 +54,11 @@ jobs:
 
       - name: Build (macOS)
         if: runner.os == 'macOS'
+        run: |
+          pyinstaller --noconfirm --clean --windowed --onefile --name D2Runner main.py
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
         run: |
           pyinstaller --noconfirm --clean --windowed --onefile --name D2Runner main.py
 
@@ -62,6 +74,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: D2Runner-macos
+          path: dist/D2Runner
+
+      - name: Upload artifact (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: D2Runner-linux
           path: dist/D2Runner
 
   release:
@@ -81,12 +100,18 @@ jobs:
           mkdir -p release-dist
           cp "release-assets/D2Runner-windows/D2Runner.exe" "release-dist/D2Runner.exe"
           cp "release-assets/D2Runner-macos/D2Runner" "release-dist/D2Runner"
+          cp "release-assets/D2Runner-linux/D2Runner" "release-dist/D2Runner-linux"
           chmod +x "release-dist/D2Runner" || true
+          chmod +x "release-dist/D2Runner-linux" || true
           (
             cd release-dist
             zip -9 "D2Runner-windows-x64-${TAG}.zip" "D2Runner.exe"
             zip -9 "D2Runner-macos-arm64-${TAG}.zip" "D2Runner"
-            sha256sum "D2Runner-windows-x64-${TAG}.zip" "D2Runner-macos-arm64-${TAG}.zip" > "SHA256SUMS.txt"
+            tar -czf "D2Runner-linux-x64-${TAG}.tar.gz" "D2Runner-linux"
+            sha256sum \
+              "D2Runner-windows-x64-${TAG}.zip" \
+              "D2Runner-macos-arm64-${TAG}.zip" \
+              "D2Runner-linux-x64-${TAG}.tar.gz" > "SHA256SUMS.txt"
           )
 
       - name: Publish GitHub Release
@@ -96,4 +121,5 @@ jobs:
           files: |
             release-dist/D2Runner-windows-x64-${{ github.ref_name }}.zip
             release-dist/D2Runner-macos-arm64-${{ github.ref_name }}.zip
+            release-dist/D2Runner-linux-x64-${{ github.ref_name }}.tar.gz
             release-dist/SHA256SUMS.txt
