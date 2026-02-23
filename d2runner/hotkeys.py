@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Callable
 import sys
+import time
 
 
 HotkeyHandler = Callable[[str], None]
@@ -118,6 +119,8 @@ class HotkeyBackend:
         self.log = logging.getLogger("d2runner.hotkeys")
         self._pressed_mods: set[str] = set()
         self._fired_keys: set[str] = set()
+        self._last_action_at: dict[str, float] = {}
+        self._repeat_guard_ms = 700
         self.keyboard_map = dict(keyboard_map)
         self._parsed_bindings: dict[str, ParsedCombo] = {}
         self._reload_parsed_bindings()
@@ -237,6 +240,16 @@ class HotkeyBackend:
                             sorted(self._pressed_mods),
                             action,
                         )
+                        if self._should_throttle_action(action):
+                            self.log.info(
+                                "hotkey_throttled key=%s mods=%s action=%s repeat_guard_ms=%s",
+                                token,
+                                sorted(self._pressed_mods),
+                                action,
+                                self._repeat_guard_ms,
+                            )
+                            self._fired_keys.add(token)
+                            return
                         self._fired_keys.add(token)
                         self.on_action(action)
                         return
@@ -265,3 +278,11 @@ class HotkeyBackend:
             self.log.info("raw_release key=%r mods=%s", key, sorted(self._pressed_mods))
 
         return _on_release
+
+    def _should_throttle_action(self, action: str) -> bool:
+        now = time.monotonic()
+        last = self._last_action_at.get(action)
+        self._last_action_at[action] = now
+        if last is None:
+            return False
+        return (now - last) * 1000 < self._repeat_guard_ms

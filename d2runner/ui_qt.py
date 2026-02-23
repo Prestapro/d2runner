@@ -211,7 +211,6 @@ class D2RunnerQtApp:
         for w in [
             self.session_card,
             self.timer_card,
-            self.compact_panel,
             self.run_label,
             self.session_label,
             self.csv_label,
@@ -235,6 +234,10 @@ class D2RunnerQtApp:
                 w.show()
             except Exception:
                 pass
+        try:
+            self.compact_panel.hide()
+        except Exception:
+            pass
 
         if self.overlay_mode not in {"compact", "mini"}:
             try:
@@ -273,6 +276,8 @@ class D2RunnerQtApp:
             if self.overlay_mode == "compact":
                 self.compact_run_label.setStyleSheet("font-weight: 700; font-size: 7px;")
                 self.compact_timer_label.setStyleSheet("font-size: 11px; font-weight: 700;")
+                self.compact_restore_btn.setText("N")
+                self.compact_restore_btn.setFixedSize(14, 14)
                 try:
                     self.compact_layout.setContentsMargins(3, 2, 3, 2)
                     self.compact_layout.setSpacing(0)
@@ -281,6 +286,8 @@ class D2RunnerQtApp:
             else:
                 self.compact_run_label.setStyleSheet("font-weight: 700; font-size: 15px;")
                 self.compact_timer_label.setStyleSheet("font-size: 26px; font-weight: 700;")
+                self.compact_restore_btn.setText("Normal")
+                self.compact_restore_btn.setFixedSize(52, 18)
                 try:
                     self.compact_layout.setContentsMargins(9, 6, 9, 6)
                     self.compact_layout.setSpacing(2)
@@ -715,9 +722,18 @@ class D2RunnerQtApp:
         self.compact_layout = compact_layout
         compact_layout.setContentsMargins(3, 2, 3, 2)
         compact_layout.setSpacing(0)
+        compact_header = self.QHBoxLayout()
+        compact_header.setContentsMargins(0, 0, 0, 0)
+        compact_header.setSpacing(2)
         self.compact_run_label = self.QLabel("Run #1")
         self.compact_run_label.setStyleSheet("font-weight: 700; font-size: 7px;")
-        compact_layout.addWidget(self.compact_run_label)
+        compact_header.addWidget(self.compact_run_label, 1)
+        self.compact_restore_btn = self.QPushButton("N")
+        self.compact_restore_btn.setToolTip("Normal View")
+        self.compact_restore_btn.setFixedSize(14, 14)
+        self.compact_restore_btn.clicked.connect(lambda: self._set_overlay_mode("off"))  # type: ignore[attr-defined]
+        compact_header.addWidget(self.compact_restore_btn, 0)
+        compact_layout.addLayout(compact_header)
         self.compact_timer_label = self.QLabel("00:00.00")
         self.compact_timer_label.setObjectName("Timer")
         self.compact_timer_label.setStyleSheet("font-size: 11px; font-weight: 700;")
@@ -947,6 +963,8 @@ class D2RunnerQtApp:
             self.btn_hide_tray.setEnabled(True)
         if hasattr(self, "btn_mini_mode"):
             self.btn_mini_mode.setEnabled(True)
+        if hasattr(self, "compact_restore_btn"):
+            self.compact_restore_btn.setEnabled(True)
         self.limit_label.setText(self._limit_text())
 
     def _refresh_visual_state(self) -> None:
@@ -1014,7 +1032,9 @@ class D2RunnerQtApp:
 
     def _tick(self) -> None:
         self._drain_queue()
-        self.timer_label.setText(self.tracker.formatted_elapsed())
+        elapsed = self.tracker.formatted_elapsed()
+        self.timer_label.setText(elapsed)
+        self.compact_timer_label.setText(elapsed)
 
     def _find_duplicate_bindings(self, keyboard_map: dict[str, str]) -> tuple[str, list[str]] | None:
         seen: dict[str, list[str]] = {}
