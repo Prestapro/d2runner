@@ -251,47 +251,85 @@ class ControllerBackend:
                     self.log.warning("controller_display_init_failed %s", exc)
             pygame.joystick.init()
 
-            count = pygame.joystick.get_count()
-            self.log.info("controller_devices_detected count=%s", count)
-            if count <= self.config.device_index:
+            joystick = None
+            has_hat = False
+            button_dpad_map = None
+            named_button_map = None
+            axis_dpad_pair = None
+            xinput = None
+            last_count_logged = None
+            missing_logged = False
+
+            # Wireless adapters may appear a moment after app startup; keep retrying
+            # in the background instead of exiting the controller thread immediately.
+            while not self._stop.is_set() and joystick is None and xinput is None:
+                try:
+                    pygame.event.pump()
+                except Exception:
+                    pass
+                try:
+                    count = int(pygame.joystick.get_count())
+                except Exception:
+                    count = 0
+                if count != last_count_logged:
+                    self.log.info("controller_devices_detected count=%s", count)
+                    last_count_logged = count
+
+                xinput = self._try_init_xinput(self.config.device_index)
+                if xinput is not None:
+                    self.available = True
+                    self.error = None
+                    self.log.info("controller_xinput_only_mode user_index=%s", xinput["user_index"])
+                    break
+
+                if count > self.config.device_index:
+                    joystick = pygame.joystick.Joystick(self.config.device_index)
+                    joystick.init()
+                    self.available = True
+                    self.error = None
+                    self.log.info(
+                        "controller_connected name=%s index=%s instance_id=%s hats=%s buttons=%s axes=%s",
+                        joystick.get_name(),
+                        self.config.device_index,
+                        getattr(joystick, "get_instance_id", lambda: "n/a")(),
+                        joystick.get_numhats(),
+                        joystick.get_numbuttons(),
+                        joystick.get_numaxes(),
+                    )
+                    has_hat = joystick.get_numhats() > self.config.hat_index
+                    button_dpad_map = self._guess_dpad_button_map(joystick.get_numbuttons())
+                    named_button_map = self._guess_named_button_map(joystick.get_numbuttons())
+                    axis_dpad_pair = self._guess_dpad_axis_pair(joystick.get_numaxes())
+                    if not has_hat and button_dpad_map is None and axis_dpad_pair is None:
+                        self.error = (
+                            f"controller dpad not available (hats={joystick.get_numhats()}, "
+                            f"buttons={joystick.get_numbuttons()}, axes={joystick.get_numaxes()})"
+                        )
+                        self.log.warning("controller_dpad_not_available %s", self.error)
+                        return
+                    self.log.info(
+                        "controller_dpad_sources hat=%s hat_index=%s button_map=%s axis_pair=%s",
+                        has_hat,
+                        self.config.hat_index,
+                        button_dpad_map,
+                        axis_dpad_pair,
+                    )
+                    self.log.info("controller_named_button_sources button_map=%s", named_button_map)
+                    break
+
                 self.error = f"controller not found at index {self.config.device_index} (count={count})"
+                if not missing_logged:
+                    self.log.warning("controller_not_found %s", self.error)
+                    missing_logged = True
+                time.sleep(0.5)
+
+            if self._stop.is_set():
+                return
+            if joystick is None and xinput is None:
+                self.error = f"controller not found at index {self.config.device_index}"
                 self.log.warning("controller_not_found %s", self.error)
                 return
 
-            joystick = pygame.joystick.Joystick(self.config.device_index)
-            joystick.init()
-            self.available = True
-            self.log.info(
-                "controller_connected name=%s index=%s instance_id=%s hats=%s buttons=%s axes=%s",
-                joystick.get_name(),
-                self.config.device_index,
-                getattr(joystick, "get_instance_id", lambda: "n/a")(),
-                joystick.get_numhats(),
-                joystick.get_numbuttons(),
-                joystick.get_numaxes(),
-            )
-            has_hat = joystick.get_numhats() > self.config.hat_index
-            button_dpad_map = self._guess_dpad_button_map(joystick.get_numbuttons())
-            named_button_map = self._guess_named_button_map(joystick.get_numbuttons())
-            axis_dpad_pair = self._guess_dpad_axis_pair(joystick.get_numaxes())
-            if not has_hat and button_dpad_map is None and axis_dpad_pair is None:
-                self.error = (
-                    f"controller dpad not available (hats={joystick.get_numhats()}, "
-                    f"buttons={joystick.get_numbuttons()}, axes={joystick.get_numaxes()})"
-                )
-                self.log.warning("controller_dpad_not_available %s", self.error)
-                return
-
-            self.log.info(
-                "controller_dpad_sources hat=%s hat_index=%s button_map=%s axis_pair=%s",
-                has_hat,
-                self.config.hat_index,
-                button_dpad_map,
-                axis_dpad_pair,
-            )
-            self.log.info("controller_named_button_sources button_map=%s", named_button_map)
-
-            xinput = self._try_init_xinput(self.config.device_index)
             if xinput is not None:
                 self.log.info(
                     "controller_xinput_enabled user_index=%s dll=%s",
@@ -330,7 +368,7 @@ class ControllerBackend:
                     if xinput_button_name is not None:
                         button_name = xinput_button_name
 
-                if direction is None and has_hat:
+                if direction is None and joystick is not None and has_hat:
                     try:
                         value = joystick.get_hat(self.config.hat_index)
                     except Exception as exc:
@@ -342,14 +380,14 @@ class ControllerBackend:
                         self.log.info("controller_hat_motion hat=%s value=%s", self.config.hat_index, value)
                         direction = self._direction_from_hat(value)
 
-                if direction is None and axis_dpad_pair is not None:
+                if direction is None and joystick is not None and axis_dpad_pair is not None:
                     axes_direction = self._poll_axes_dpad(joystick, axis_dpad_pair)
                     if axes_direction != prev_axes_direction:
                         self.log.info("controller_axes_dpad axis_pair=%s direction=%s", axis_dpad_pair, axes_direction)
                         prev_axes_direction = axes_direction
                         direction = axes_direction
 
-                if direction is None and button_dpad_map is not None:
+                if direction is None and joystick is not None and button_dpad_map is not None:
                     prev_all_buttons_pressed = self._poll_all_buttons_debug(
                         joystick,
                         prev_all_buttons_pressed,
@@ -361,7 +399,7 @@ class ControllerBackend:
                     )
                     direction = buttons_direction
 
-                if button_name is None and named_button_map is not None:
+                if button_name is None and joystick is not None and named_button_map is not None:
                     button_name, prev_named_buttons_pressed = self._poll_named_buttons(
                         joystick,
                         named_button_map,
