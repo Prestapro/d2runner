@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import json
 from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
 import sys
+import time
 
 from .controller import (
     ControllerBackend,
@@ -20,7 +22,7 @@ from .hotkeys import ACTION_ORDER, ACTION_TITLES, HotkeyBackend, human_combo_lab
 
 def _qt_imports():
     from PySide6.QtCore import QTimer, Qt
-    from PySide6.QtGui import QAction, QColor, QKeySequence, QShortcut
+    from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QShortcut
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -49,6 +51,7 @@ def _qt_imports():
         "QApplication": QApplication,
         "QCheckBox": QCheckBox,
         "QColor": QColor,
+        "QImage": QImage,
         "QComboBox": QComboBox,
         "QDialog": QDialog,
         "QDialogButtonBox": QDialogButtonBox,
@@ -143,6 +146,7 @@ class D2RunnerQtApp:
         self.QComboBox = self.qt["QComboBox"]
         self.QCheckBox = self.qt["QCheckBox"]
         self.QColor = self.qt["QColor"]
+        self.QImage = self.qt["QImage"]
         self.QMenu = self.qt["QMenu"]
         self.QSpinBox = self.qt["QSpinBox"]
         self.QStyle = self.qt["QStyle"]
@@ -158,6 +162,15 @@ class D2RunnerQtApp:
         self.tracker = RunTracker(CsvRunLogger(self.current_csv_path))
         self.controller_config_path = Path(controller_config_path)
         self.controller_config = load_controller_config(self.controller_config_path, self.log)
+        self.auto_detect_config_path = self.controller_config_path.with_name("auto_detect_config.json")
+        self.auto_detect_config = self._load_auto_detect_config()
+        self._auto_last_poll_at = 0.0
+        self._auto_pause_seen_at = 0.0
+        self._auto_last_fire_at = 0.0
+        self._auto_pause_streak = 0
+        self._auto_lobby_streak = 0
+        self._auto_last_pause_match = False
+        self._auto_last_lobby_match = False
         self.hotkeys = HotkeyBackend(
             lambda action: self.command_queue.put(("global_hotkey", action)),
             self.controller_config.keyboard_map,
@@ -1043,9 +1056,297 @@ class D2RunnerQtApp:
 
     def _tick(self) -> None:
         self._drain_queue()
+        self._auto_detect_tick()
         elapsed = self.tracker.formatted_elapsed()
         self.timer_label.setText(elapsed)
         self.compact_timer_label.setText(elapsed)
+
+    def _default_auto_detect_config(self) -> dict[str, object]:
+        return {
+            "enabled": False,
+            "poll_ms": 250,
+            "min_transition_ms": 1000,
+            "max_transition_ms": 10000,
+            "cooldown_ms": 2500,
+            "match_threshold_bits": 12,
+            "pause_template": None,
+            "lobby_template": None,
+        }
+
+    def _load_auto_detect_config(self) -> dict[str, object]:
+        cfg = self._default_auto_detect_config()
+        path = self.auto_detect_config_path
+        try:
+            if path.exists():
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    cfg.update(raw)
+            else:
+                path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+                self.log.info("auto_detect_config_created path=%s", path)
+        except Exception:
+            self.log.exception("auto_detect_config_load_failed path=%s", path)
+        for key in ("pause_template", "lobby_template"):
+            tpl = cfg.get(key)
+            if not self._is_valid_auto_template(tpl):
+                cfg[key] = None
+        self.log.info(
+            "auto_detect_config_loaded path=%s enabled=%s poll_ms=%s templates pause=%s lobby=%s",
+            path,
+            cfg.get("enabled"),
+            cfg.get("poll_ms"),
+            bool(cfg.get("pause_template")),
+            bool(cfg.get("lobby_template")),
+        )
+        return cfg
+
+    def _save_auto_detect_config(self) -> None:
+        try:
+            self.auto_detect_config_path.write_text(json.dumps(self.auto_detect_config, indent=2), encoding="utf-8")
+            self.log.info("auto_detect_config_saved path=%s", self.auto_detect_config_path)
+        except Exception:
+            self.log.exception("auto_detect_config_save_failed path=%s", self.auto_detect_config_path)
+
+    @staticmethod
+    def _is_valid_auto_template(tpl: object) -> bool:
+        if not isinstance(tpl, dict):
+            return False
+        roi = tpl.get("roi")
+        dhash = tpl.get("dhash")
+        if not isinstance(roi, dict) or not isinstance(dhash, str):
+            return False
+        for k in ("x", "y", "w", "h"):
+            v = roi.get(k)
+            if not isinstance(v, (int, float)):
+                return False
+        return len(dhash) == 16
+
+    def _auto_pause_roi(self) -> dict[str, float]:
+        # Center column with logo + pause menu buttons; background can vary by act.
+        return {"x": 0.38, "y": 0.10, "w": 0.24, "h": 0.60}
+
+    def _auto_lobby_roi(self) -> dict[str, float]:
+        # Center-right create-game panel avoids chat log noise on the left.
+        return {"x": 0.56, "y": 0.05, "w": 0.39, "h": 0.72}
+
+    def _capture_fullscreen_qimage(self):
+        screen = self.qt_app.primaryScreen()
+        if screen is None:
+            return None
+        try:
+            pixmap = screen.grabWindow(0)
+            if pixmap.isNull():
+                return None
+            return pixmap.toImage()
+        except Exception:
+            self.log.exception("auto_detect_screen_capture_failed")
+            return None
+
+    def _crop_roi_qimage(self, image, roi: dict[str, float]):
+        try:
+            iw = int(image.width())
+            ih = int(image.height())
+        except Exception:
+            return None
+        if iw <= 0 or ih <= 0:
+            return None
+        x = max(0, min(iw - 1, int(round(float(roi["x"]) * iw))))
+        y = max(0, min(ih - 1, int(round(float(roi["y"]) * ih))))
+        w = max(1, int(round(float(roi["w"]) * iw)))
+        h = max(1, int(round(float(roi["h"]) * ih)))
+        if x + w > iw:
+            w = iw - x
+        if y + h > ih:
+            h = ih - y
+        if w <= 0 or h <= 0:
+            return None
+        try:
+            return image.copy(x, y, w, h)
+        except Exception:
+            return None
+
+    def _compute_dhash64(self, image) -> str | None:
+        try:
+            fmt_gray = getattr(self.QImage, "Format_Grayscale8", None)
+            if fmt_gray is None and hasattr(self.QImage, "Format"):
+                fmt_gray = getattr(self.QImage.Format, "Format_Grayscale8", None)
+            if fmt_gray is None:
+                return None
+            gray = image.convertToFormat(fmt_gray)
+            small = gray.scaled(9, 8, self.Qt.IgnoreAspectRatio, self.Qt.SmoothTransformation)
+        except Exception:
+            return None
+        bits = 0
+        bit_index = 0
+        try:
+            for y in range(8):
+                for x in range(8):
+                    l = small.pixelColor(x, y).red()
+                    r = small.pixelColor(x + 1, y).red()
+                    if l > r:
+                        bits |= (1 << bit_index)
+                    bit_index += 1
+        except Exception:
+            return None
+        return f"{bits:016x}"
+
+    def _hamming_bits(self, a_hex: str, b_hex: str) -> int | None:
+        try:
+            return (int(a_hex, 16) ^ int(b_hex, 16)).bit_count()
+        except Exception:
+            return None
+
+    def _build_auto_template_from_screen(self, kind: str) -> dict[str, object] | None:
+        image = self._capture_fullscreen_qimage()
+        if image is None:
+            return None
+        roi = self._auto_pause_roi() if kind == "pause" else self._auto_lobby_roi()
+        cropped = self._crop_roi_qimage(image, roi)
+        if cropped is None:
+            return None
+        dhash = self._compute_dhash64(cropped)
+        if not dhash:
+            return None
+        return {
+            "kind": kind,
+            "captured_at": datetime.now().isoformat(timespec="seconds"),
+            "screen_size": {"w": int(image.width()), "h": int(image.height())},
+            "roi": roi,
+            "dhash": dhash,
+        }
+
+    def _match_auto_template(self, image, tpl: object, threshold_bits: int) -> tuple[bool, int | None]:
+        if image is None or not self._is_valid_auto_template(tpl):
+            return False, None
+        roi = tpl["roi"]
+        cropped = self._crop_roi_qimage(image, roi)
+        if cropped is None:
+            return False, None
+        current_hash = self._compute_dhash64(cropped)
+        if not current_hash:
+            return False, None
+        dist = self._hamming_bits(current_hash, tpl["dhash"])
+        if dist is None:
+            return False, None
+        return dist <= max(int(threshold_bits), 0), dist
+
+    def _auto_detect_ready(self) -> bool:
+        cfg = self.auto_detect_config
+        return (
+            bool(cfg.get("enabled"))
+            and self._is_valid_auto_template(cfg.get("pause_template"))
+            and self._is_valid_auto_template(cfg.get("lobby_template"))
+        )
+
+    def _auto_detect_tick(self) -> None:
+        cfg = self.auto_detect_config
+        if not self._auto_detect_ready():
+            return
+        now = time.monotonic()
+        poll_ms = max(50, int(cfg.get("poll_ms", 250)))
+        if (now - self._auto_last_poll_at) * 1000 < poll_ms:
+            return
+        self._auto_last_poll_at = now
+
+        image = self._capture_fullscreen_qimage()
+        if image is None:
+            return
+
+        threshold = int(cfg.get("match_threshold_bits", 12))
+        pause_match, pause_dist = self._match_auto_template(image, cfg.get("pause_template"), threshold)
+        lobby_match, lobby_dist = self._match_auto_template(image, cfg.get("lobby_template"), threshold)
+        self._auto_pause_streak = (self._auto_pause_streak + 1) if pause_match else 0
+        self._auto_lobby_streak = (self._auto_lobby_streak + 1) if lobby_match else 0
+
+        if pause_match != self._auto_last_pause_match or lobby_match != self._auto_last_lobby_match:
+            self.log.info(
+                "auto_detect_match pause=%s pause_dist=%s lobby=%s lobby_dist=%s streak_pause=%s streak_lobby=%s",
+                pause_match,
+                pause_dist,
+                lobby_match,
+                lobby_dist,
+                self._auto_pause_streak,
+                self._auto_lobby_streak,
+            )
+            self._auto_last_pause_match = pause_match
+            self._auto_last_lobby_match = lobby_match
+
+        if self._auto_pause_streak >= 2 and self._auto_pause_seen_at <= 0:
+            self._auto_pause_seen_at = now
+            self.log.info("auto_detect_pause_sequence_started")
+
+        if self._auto_pause_seen_at > 0:
+            elapsed_ms = int((now - self._auto_pause_seen_at) * 1000)
+            min_ms = max(0, int(cfg.get("min_transition_ms", 1000)))
+            max_ms = max(min_ms, int(cfg.get("max_transition_ms", 10000)))
+            if elapsed_ms > max_ms:
+                self.log.info("auto_detect_sequence_expired elapsed_ms=%s", elapsed_ms)
+                self._auto_pause_seen_at = 0.0
+                self._auto_pause_streak = 0
+                return
+            if (
+                self._auto_lobby_streak >= 2
+                and elapsed_ms >= min_ms
+                and (now - self._auto_last_fire_at) * 1000 >= max(0, int(cfg.get("cooldown_ms", 2500)))
+            ):
+                self._auto_last_fire_at = now
+                self._auto_pause_seen_at = 0.0
+                self._auto_pause_streak = 0
+                self._auto_lobby_streak = 0
+                self.log.info("auto_detect_trigger_next_run elapsed_ms=%s", elapsed_ms)
+                self.handle_action("next_run", source="auto_detect")
+
+    def _reset_auto_detect_state(self) -> None:
+        self._auto_last_poll_at = 0.0
+        self._auto_pause_seen_at = 0.0
+        self._auto_last_fire_at = 0.0
+        self._auto_pause_streak = 0
+        self._auto_lobby_streak = 0
+        self._auto_last_pause_match = False
+        self._auto_last_lobby_match = False
+
+    def _capture_auto_template_delayed(self, kind: str, parent_dialog) -> None:
+        label = "Save&Exit" if kind == "pause" else "Lobby/Create Game"
+        self.log.info("auto_detect_capture_requested kind=%s", kind)
+        try:
+            parent_dialog.hide()
+        except Exception:
+            pass
+        try:
+            self.window.hide()
+        except Exception:
+            pass
+
+        def _finish_capture() -> None:
+            tpl = self._build_auto_template_from_screen(kind)
+            if tpl is not None:
+                key = "pause_template" if kind == "pause" else "lobby_template"
+                self.auto_detect_config[key] = tpl
+                self._save_auto_detect_config()
+                self.log.info("auto_detect_template_captured kind=%s dhash=%s", kind, tpl.get("dhash"))
+                try:
+                    self.QMessageBox.information(parent_dialog, "Auto Detect", f"{label} template captured.")
+                except Exception:
+                    pass
+            else:
+                self.log.warning("auto_detect_template_capture_failed kind=%s", kind)
+                try:
+                    self.QMessageBox.warning(parent_dialog, "Auto Detect", f"Failed to capture {label} template.")
+                except Exception:
+                    pass
+            try:
+                self.window.show()
+                self._position_overlay()
+            except Exception:
+                pass
+            try:
+                parent_dialog.show()
+                parent_dialog.raise_()
+                parent_dialog.activateWindow()
+            except Exception:
+                pass
+
+        self.QTimer.singleShot(1800, _finish_capture)
 
     def _find_duplicate_bindings(self, keyboard_map: dict[str, str]) -> tuple[str, list[str]] | None:
         seen: dict[str, list[str]] = {}
@@ -1084,7 +1385,7 @@ class D2RunnerQtApp:
         dlg = self.QDialog(self.window)
         dlg.setWindowTitle("Settings")
         dlg.setModal(True)
-        dlg.resize(640, 520)
+        dlg.resize(700, 700)
 
         # ── Settings dialog stylesheet ──
         _lbl_style = "font-size: 13px; font-weight: 400; color: rgba(29,29,31,179);"
@@ -1202,6 +1503,82 @@ class D2RunnerQtApp:
         guard_spin.setValue(self.controller_config.repeat_guard_ms)
         top_grid.addWidget(guard_spin, 4, 1)
 
+        auto_cfg = self.auto_detect_config
+        auto_enable_cb = self.QCheckBox("Enable auto-detect new run (Save&Exit -> Lobby)")
+        auto_enable_cb.setChecked(bool(auto_cfg.get("enabled", False)))
+        top_grid.addWidget(auto_enable_cb, 5, 0, 1, 2)
+
+        lbl_poll = self.QLabel("Auto poll ms")
+        lbl_poll.setStyleSheet(_lbl_style)
+        top_grid.addWidget(lbl_poll, 6, 0)
+        auto_poll_spin = self.QSpinBox()
+        auto_poll_spin.setRange(50, 5000)
+        auto_poll_spin.setValue(int(auto_cfg.get("poll_ms", 250)))
+        top_grid.addWidget(auto_poll_spin, 6, 1)
+
+        lbl_min = self.QLabel("Min transition ms")
+        lbl_min.setStyleSheet(_lbl_style)
+        top_grid.addWidget(lbl_min, 7, 0)
+        auto_min_spin = self.QSpinBox()
+        auto_min_spin.setRange(0, 30000)
+        auto_min_spin.setValue(int(auto_cfg.get("min_transition_ms", 1000)))
+        top_grid.addWidget(auto_min_spin, 7, 1)
+
+        lbl_max = self.QLabel("Max transition ms")
+        lbl_max.setStyleSheet(_lbl_style)
+        top_grid.addWidget(lbl_max, 8, 0)
+        auto_max_spin = self.QSpinBox()
+        auto_max_spin.setRange(100, 60000)
+        auto_max_spin.setValue(int(auto_cfg.get("max_transition_ms", 10000)))
+        top_grid.addWidget(auto_max_spin, 8, 1)
+
+        lbl_cool = self.QLabel("Auto cooldown ms")
+        lbl_cool.setStyleSheet(_lbl_style)
+        top_grid.addWidget(lbl_cool, 9, 0)
+        auto_cool_spin = self.QSpinBox()
+        auto_cool_spin.setRange(0, 60000)
+        auto_cool_spin.setValue(int(auto_cfg.get("cooldown_ms", 2500)))
+        top_grid.addWidget(auto_cool_spin, 9, 1)
+
+        lbl_thr = self.QLabel("Match threshold (bits)")
+        lbl_thr.setStyleSheet(_lbl_style)
+        top_grid.addWidget(lbl_thr, 10, 0)
+        auto_thr_spin = self.QSpinBox()
+        auto_thr_spin.setRange(0, 64)
+        auto_thr_spin.setValue(int(auto_cfg.get("match_threshold_bits", 12)))
+        top_grid.addWidget(auto_thr_spin, 10, 1)
+
+        auto_tpl_info = self.QLabel()
+        auto_tpl_info.setWordWrap(True)
+        auto_tpl_info.setStyleSheet("font-size: 12px; color: rgba(29,29,31,120);")
+
+        def _refresh_auto_tpl_info() -> None:
+            p = self.auto_detect_config.get("pause_template")
+            l = self.auto_detect_config.get("lobby_template")
+            p_state = f"pause=ok ({p.get('captured_at', '?')})" if isinstance(p, dict) else "pause=missing"
+            l_state = f"lobby=ok ({l.get('captured_at', '?')})" if isinstance(l, dict) else "lobby=missing"
+            auto_tpl_info.setText(
+                "Auto templates use fixed screen regions (center menu + lobby create game panel). "
+                f"Current templates: {p_state}, {l_state}."
+            )
+
+        auto_btn_row = self.QHBoxLayout()
+        btn_cap_pause = self.QPushButton("Capture Save&Exit (1.8s)")
+        btn_cap_lobby = self.QPushButton("Capture Lobby (1.8s)")
+        btn_cap_pause.clicked.connect(lambda: _cap_auto("pause"))  # type: ignore[attr-defined]
+        btn_cap_lobby.clicked.connect(lambda: _cap_auto("lobby"))  # type: ignore[attr-defined]
+        auto_btn_row.addWidget(btn_cap_pause)
+        auto_btn_row.addWidget(btn_cap_lobby)
+        auto_btn_row.addStretch(1)
+
+        def _cap_auto(kind: str) -> None:
+            self._capture_auto_template_delayed(kind, dlg)
+            self.QTimer.singleShot(2300, _refresh_auto_tpl_info)
+
+        _refresh_auto_tpl_info()
+        top_grid.addLayout(auto_btn_row, 11, 0, 1, 2)
+        top_grid.addWidget(auto_tpl_info, 12, 0, 1, 2)
+
         # ── Separator ──
         sep = self.QFrame()
         sep.setObjectName("SettingsSep")
@@ -1310,7 +1687,8 @@ class D2RunnerQtApp:
 
         info = self.QLabel(
             "Changes apply immediately after Save. D-pad and Xbox buttons are separate inputs. "
-            "Disable keyboard hotkeys to use controller-only mode."
+            "Disable keyboard hotkeys to use controller-only mode. "
+            "Auto-detect uses screenshot sequence: Save&Exit menu -> Lobby."
         )
         info.setStyleSheet("font-size: 12px; color: rgba(29,29,31,100); font-weight: 400;")
         info.setWordWrap(True)
@@ -1385,6 +1763,17 @@ class D2RunnerQtApp:
                     button_map=button_map,
                 )
                 save_controller_config(self.controller_config_path, new_cfg, self.log)
+                self.auto_detect_config = {
+                    **self.auto_detect_config,
+                    "enabled": auto_enable_cb.isChecked(),
+                    "poll_ms": auto_poll_spin.value(),
+                    "min_transition_ms": auto_min_spin.value(),
+                    "max_transition_ms": auto_max_spin.value(),
+                    "cooldown_ms": auto_cool_spin.value(),
+                    "match_threshold_bits": auto_thr_spin.value(),
+                }
+                self._save_auto_detect_config()
+                self._reset_auto_detect_state()
                 self.controller_config = load_controller_config(self.controller_config_path, self.log)
                 self.hotkeys.reload_bindings(
                     self.controller_config.keyboard_map,
