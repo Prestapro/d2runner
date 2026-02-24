@@ -1064,6 +1064,7 @@ class D2RunnerQtApp:
     def _default_auto_detect_config(self) -> dict[str, object]:
         return {
             "enabled": False,
+            "monitor_index": -1,
             "poll_ms": 250,
             "min_transition_ms": 1000,
             "max_transition_ms": 10000,
@@ -1130,7 +1131,17 @@ class D2RunnerQtApp:
         return {"x": 0.56, "y": 0.05, "w": 0.39, "h": 0.72}
 
     def _capture_fullscreen_qimage(self):
-        screen = self.qt_app.primaryScreen()
+        screens = []
+        try:
+            screens = list(self.qt_app.screens() or [])
+        except Exception:
+            screens = []
+        monitor_index = int(self.auto_detect_config.get("monitor_index", -1))
+        screen = None
+        if monitor_index >= 0 and monitor_index < len(screens):
+            screen = screens[monitor_index]
+        if screen is None:
+            screen = self.qt_app.primaryScreen()
         if screen is None:
             return None
         try:
@@ -1508,45 +1519,53 @@ class D2RunnerQtApp:
         auto_enable_cb.setChecked(bool(auto_cfg.get("enabled", False)))
         top_grid.addWidget(auto_enable_cb, 5, 0, 1, 2)
 
+        lbl_mon = self.QLabel("Auto monitor index (-1=primary)")
+        lbl_mon.setStyleSheet(_lbl_style)
+        top_grid.addWidget(lbl_mon, 6, 0)
+        auto_mon_spin = self.QSpinBox()
+        auto_mon_spin.setRange(-1, 8)
+        auto_mon_spin.setValue(int(auto_cfg.get("monitor_index", -1)))
+        top_grid.addWidget(auto_mon_spin, 6, 1)
+
         lbl_poll = self.QLabel("Auto poll ms")
         lbl_poll.setStyleSheet(_lbl_style)
-        top_grid.addWidget(lbl_poll, 6, 0)
+        top_grid.addWidget(lbl_poll, 7, 0)
         auto_poll_spin = self.QSpinBox()
         auto_poll_spin.setRange(50, 5000)
         auto_poll_spin.setValue(int(auto_cfg.get("poll_ms", 250)))
-        top_grid.addWidget(auto_poll_spin, 6, 1)
+        top_grid.addWidget(auto_poll_spin, 7, 1)
 
         lbl_min = self.QLabel("Min transition ms")
         lbl_min.setStyleSheet(_lbl_style)
-        top_grid.addWidget(lbl_min, 7, 0)
+        top_grid.addWidget(lbl_min, 8, 0)
         auto_min_spin = self.QSpinBox()
         auto_min_spin.setRange(0, 30000)
         auto_min_spin.setValue(int(auto_cfg.get("min_transition_ms", 1000)))
-        top_grid.addWidget(auto_min_spin, 7, 1)
+        top_grid.addWidget(auto_min_spin, 8, 1)
 
         lbl_max = self.QLabel("Max transition ms")
         lbl_max.setStyleSheet(_lbl_style)
-        top_grid.addWidget(lbl_max, 8, 0)
+        top_grid.addWidget(lbl_max, 9, 0)
         auto_max_spin = self.QSpinBox()
         auto_max_spin.setRange(100, 60000)
         auto_max_spin.setValue(int(auto_cfg.get("max_transition_ms", 10000)))
-        top_grid.addWidget(auto_max_spin, 8, 1)
+        top_grid.addWidget(auto_max_spin, 9, 1)
 
         lbl_cool = self.QLabel("Auto cooldown ms")
         lbl_cool.setStyleSheet(_lbl_style)
-        top_grid.addWidget(lbl_cool, 9, 0)
+        top_grid.addWidget(lbl_cool, 10, 0)
         auto_cool_spin = self.QSpinBox()
         auto_cool_spin.setRange(0, 60000)
         auto_cool_spin.setValue(int(auto_cfg.get("cooldown_ms", 2500)))
-        top_grid.addWidget(auto_cool_spin, 9, 1)
+        top_grid.addWidget(auto_cool_spin, 10, 1)
 
         lbl_thr = self.QLabel("Match threshold (bits)")
         lbl_thr.setStyleSheet(_lbl_style)
-        top_grid.addWidget(lbl_thr, 10, 0)
+        top_grid.addWidget(lbl_thr, 11, 0)
         auto_thr_spin = self.QSpinBox()
         auto_thr_spin.setRange(0, 64)
         auto_thr_spin.setValue(int(auto_cfg.get("match_threshold_bits", 12)))
-        top_grid.addWidget(auto_thr_spin, 10, 1)
+        top_grid.addWidget(auto_thr_spin, 11, 1)
 
         auto_tpl_info = self.QLabel()
         auto_tpl_info.setWordWrap(True)
@@ -1557,8 +1576,13 @@ class D2RunnerQtApp:
             l = self.auto_detect_config.get("lobby_template")
             p_state = f"pause=ok ({p.get('captured_at', '?')})" if isinstance(p, dict) else "pause=missing"
             l_state = f"lobby=ok ({l.get('captured_at', '?')})" if isinstance(l, dict) else "lobby=missing"
+            try:
+                screen_count = len(self.qt_app.screens() or [])
+            except Exception:
+                screen_count = 0
             auto_tpl_info.setText(
                 "Auto templates use fixed screen regions (center menu + lobby create game panel). "
+                f"Screens={screen_count}, monitor={auto_mon_spin.value()}. "
                 f"Current templates: {p_state}, {l_state}."
             )
 
@@ -1572,12 +1596,13 @@ class D2RunnerQtApp:
         auto_btn_row.addStretch(1)
 
         def _cap_auto(kind: str) -> None:
+            self.auto_detect_config = {**self.auto_detect_config, "monitor_index": auto_mon_spin.value()}
             self._capture_auto_template_delayed(kind, dlg)
             self.QTimer.singleShot(2300, _refresh_auto_tpl_info)
 
         _refresh_auto_tpl_info()
-        top_grid.addLayout(auto_btn_row, 11, 0, 1, 2)
-        top_grid.addWidget(auto_tpl_info, 12, 0, 1, 2)
+        top_grid.addLayout(auto_btn_row, 12, 0, 1, 2)
+        top_grid.addWidget(auto_tpl_info, 13, 0, 1, 2)
 
         # ── Separator ──
         sep = self.QFrame()
@@ -1766,6 +1791,7 @@ class D2RunnerQtApp:
                 self.auto_detect_config = {
                     **self.auto_detect_config,
                     "enabled": auto_enable_cb.isChecked(),
+                    "monitor_index": auto_mon_spin.value(),
                     "poll_ms": auto_poll_spin.value(),
                     "min_transition_ms": auto_min_spin.value(),
                     "max_transition_ms": auto_max_spin.value(),
